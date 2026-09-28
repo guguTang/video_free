@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "页面视频嗅探下载",
+  "version": "1.0.0",
+  "description": "识别当前页面请求的 MP4、M3U8 等视频资源并下载。",
+  "permissions": ["activeTab", "webRequest", "downloads", "storage", "unlimitedStorage"],
+  "host_permissions": ["<all_urls>"],
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "查找页面视频",
+    "default_popup": "popup.html"
+  }
+}

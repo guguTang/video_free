@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>下载管理 - 页面视频嗅探下载</title>
+  <link rel="stylesheet" href="downloads.css">
+</head>
+<body>
+  <main>
+    <header>
+      <div>
+        <h1>下载管理</h1>
+        <p id="summary">选择 M3U8 视频并开始合并下载</p>
+      </div>
+      <button id="refresh" type="button">刷新</button>
+    </header>
+    <section class="playlist-section">
+      <div class="section-heading">
+        <h2>页面视频流</h2>
+        <button id="load-playlists" type="button">读取当前页面</button>
+      </div>
+      <div id="playlists" class="playlist-list"></div>
+    </section>
+    <section class="downloads-section">
+      <h2>下载任务</h2>
+      <nav aria-label="下载状态筛选">
+        <button class="filter active" data-state="all" type="button">全部</button>
+        <button class="filter" data-state="in_progress" type="button">下载中</button>
+        <button class="filter" data-state="complete" type="button">已完成</button>
+        <button class="filter" data-state="interrupted" type="button">失败</button>
+      </nav>
+      <div id="downloads" aria-live="polite"></div>
+    </section>
+    <p class="note">M3U8 分片将合并为 MPEG-TS 视频文件（.ts）。加密 HLS、直播窗口外分片及站点 DRM 不支持。</p>
+  </main>
+  <script src="downloads.js"></script>
+</body>
+</html>

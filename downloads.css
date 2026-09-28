@@ -1,0 +1,35 @@
+* { box-sizing: border-box; }
+body { margin: 0; color: #1e293b; background: #f1f5f9; font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+main { max-width: 960px; margin: 0 auto; padding: 28px 20px; }
+header, .section-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+header { margin-bottom: 22px; }
+h1 { margin: 0; font-size: 24px; }
+h2 { margin: 0; font-size: 17px; }
+header p { margin: 5px 0 0; color: #64748b; }
+button { font: inherit; cursor: pointer; }
+header > button, .section-heading button, .task-actions button { padding: 7px 12px; border: 1px solid #cbd5e1; border-radius: 7px; background: white; color: #334155; }
+.playlist-section, .downloads-section { margin-top: 20px; }
+.section-heading { margin-bottom: 12px; }
+.playlist-list, #downloads { display: grid; gap: 10px; }
+.playlist-card, .task { padding: 15px; border: 1px solid #e2e8f0; border-radius: 12px; background: white; }
+.playlist-top, .task-top { display: flex; justify-content: space-between; gap: 16px; }
+.playlist-name, .task-name { overflow: hidden; color: #0f172a; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.playlist-meta, .task-meta { margin-top: 5px; color: #64748b; font-size: 12px; }
+.playlist-url { overflow: hidden; color: #94a3b8; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.playlist-card .download { flex: none; padding: 7px 12px; border: 0; border-radius: 7px; background: #2563eb; color: white; }
+.playlist-card .download:disabled { opacity: .6; cursor: wait; }
+nav { display: flex; gap: 8px; margin: 12px 0; }
+.filter { padding: 7px 14px; border: 1px solid #cbd5e1; border-radius: 18px; background: white; color: #475569; }
+.filter.active { border-color: #2563eb; background: #2563eb; color: white; }
+.empty { padding: 28px 16px; border: 1px solid #e2e8f0; border-radius: 12px; background: white; color: #64748b; text-align: center; }
+.task-status { flex: none; color: #64748b; }
+.task-status.complete { color: #15803d; }
+.task-status.interrupted { color: #dc2626; }
+progress { display: block; width: 100%; height: 8px; margin: 13px 0 6px; accent-color: #2563eb; }
+.task-bottom { display: flex; align-items: center; justify-content: space-between; gap: 12px; color: #64748b; font-size: 12px; }
+.task-actions { display: flex; gap: 7px; }
+.task-actions button { padding: 5px 9px; font-size: 12px; }
+.task-actions .danger { color: #dc2626; }
+.task-error { margin-top: 8px; color: #dc2626; font-size: 12px; }
+.note { margin-top: 18px; color: #94a3b8; font-size: 12px; }
+@media (max-width: 600px) { main { padding: 18px 12px; } .playlist-top, .task-top, .task-bottom { align-items: flex-start; flex-direction: column; } }

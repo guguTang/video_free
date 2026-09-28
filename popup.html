@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>页面视频嗅探下载</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <main>
+    <header>
+      <div>
+        <h1>页面视频</h1>
+        <p id="status">正在查找媒体请求…</p>
+      </div>
+      <button id="refresh" class="icon-button" title="刷新列表" aria-label="刷新列表">↻</button>
+    </header>
+    <section id="list" aria-live="polite"></section>
+    <footer>
+      <span id="count">0 个资源</span>
+      <button id="clear" class="text-button">清空列表</button>
+    </footer>
+    <p class="note">M3U8 是分段流媒体，下载后可能需要合并；仅下载你有权保存的内容。</p>
+  </main>
+  <script src="popup.js"></script>
+</body>
+</html>
