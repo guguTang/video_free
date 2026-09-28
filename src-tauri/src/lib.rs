@@ -47,6 +47,20 @@ struct DownloadUpdate {
     total_bytes: Option<u64>,
 }
 
+#[tauri::command]
+fn report_page_links(app: AppHandle, payload: PageLinksPayload) -> Result<(), String> {
+    let _ = app.emit("browser-page-links", payload);
+    Ok(())
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PageLinksPayload {
+    url: String,
+    title: String,
+    links: Vec<String>,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CaptureRequest {
@@ -232,6 +246,7 @@ async fn ensure_headless_browser(app: &AppHandle, state: &AppState, settings: &A
         .no_sandbox()
         .new_headless_mode()
         .user_data_dir(user_data_dir)
+        .hide()
         .args(["--autoplay-policy=no-user-gesture-required", "--disable-background-timer-throttling", "--disable-dev-shm-usage"])
         .build().map_err(|error| { debug_log(&format!("[ensure_headless_browser] config build failed: {error}")); error.to_string() })?;
     let launch_result = tokio::time::timeout(
@@ -260,6 +275,30 @@ async fn ensure_headless_browser(app: &AppHandle, state: &AppState, settings: &A
     Ok(())
 }
 
+/// After navigation, some sites show a Cloudflare/anti-bot interstitial ("Just a moment...",
+/// "请稍候...") before redirecting to the real page. Poll the document title for a bit and
+/// return once it stops looking like a challenge page (or the timeout elapses).
+async fn wait_for_challenge_page(page: &chromiumoxide::Page, timeout: std::time::Duration) {
+    let is_challenge_title = |title: &str| {
+        let lower = title.to_ascii_lowercase();
+        title.contains("请稍候") || title.contains("正在验证") || lower.contains("just a moment") || lower.contains("attention required") || lower.contains("checking your browser")
+    };
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let title = page.evaluate("document.title").await.ok().and_then(|value| value.into_value::<String>().ok()).unwrap_or_default();
+        if !is_challenge_title(&title) {
+            if !title.is_empty() { debug_log(&format!("[wait_for_challenge_page] cleared, title={title:?}")); }
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            debug_log(&format!("[wait_for_challenge_page] still on challenge page after timeout, title={title:?}"));
+            return;
+        }
+        debug_log(&format!("[wait_for_challenge_page] waiting, title={title:?}"));
+        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+    }
+}
+
 async fn open_headless_page(app: AppHandle, state: &AppState, url: &str, settings: &AppSettings) -> Result<(), String> {
     debug_log(&format!("[open_headless_page] url={url}"));
     ensure_headless_browser(&app, state, settings).await?;
@@ -269,6 +308,8 @@ async fn open_headless_page(app: AppHandle, state: &AppState, url: &str, setting
     let browser = browser_slot.as_ref().ok_or("Chromium 初始化失败")?;
     debug_log("[open_headless_page] creating new page");
     let page = browser.new_page("about:blank").await.map_err(|error| { debug_log(&format!("[open_headless_page] new_page failed: {error}")); error.to_string() })?;
+    debug_log("[open_headless_page] enabling stealth mode");
+    if let Err(error) = page.enable_stealth_mode().await { debug_log(&format!("[open_headless_page] enable_stealth_mode failed: {error}")); }
     debug_log("[open_headless_page] page created, injecting script");
     page.evaluate_on_new_document("document.addEventListener('DOMContentLoaded', () => document.querySelectorAll('video').forEach(video => { video.muted = true; video.play().catch(() => {}); }));").await
         .map_err(|error| error.to_string())?;
@@ -322,7 +363,21 @@ async fn open_headless_page(app: AppHandle, state: &AppState, url: &str, setting
     // Navigate with a generous timeout — don't block forever if page is slow.
     let goto_future = page.goto(url);
     match tokio::time::timeout(std::time::Duration::from_secs(30), goto_future).await {
-        Ok(Ok(_)) => debug_log("[open_headless_page] navigation completed"),
+        Ok(Ok(_)) => {
+            debug_log("[open_headless_page] navigation completed");
+            wait_for_challenge_page(&page, std::time::Duration::from_secs(12)).await;
+            // Some pages redirect (301/302, or JS location change) to a different URL before
+            // settling — e.g. player pages that bounce through an auth/CDN hop. If we keep using
+            // the originally-typed URL as the "source" for captured media, the Referer we later
+            // send when downloading may not match what the real (post-redirect) page would have
+            // sent, and some CDNs reject mismatched referers. Track the final URL instead.
+            if let Some(final_url) = detect_redirect(&page, url).await {
+                debug_log(&format!("[open_headless_page] redirected: {url} -> {final_url}"));
+                if let Ok(mut current) = state.headless_page_url.lock() {
+                    *current = final_url;
+                }
+            }
+        }
         Ok(Err(error)) => {
             debug_log(&format!("[open_headless_page] navigation error: {error}"));
             return Err(format!("页面导航失败: {error}"));
@@ -371,8 +426,29 @@ async fn open_visible_page_inner(app: AppHandle, url: String) -> Result<(), Stri
               const url = element.currentSrc || element.src;
               if (url) send(url);
             });
+            const extractAndSendLinks = () => {
+              try {
+                const links = [];
+                const seen = new Set();
+                for (const a of document.querySelectorAll('a[href]')) {
+                  let href; try { href = new URL(a.href, location.href).href; } catch { continue; }
+                  if (!href.startsWith('http')) continue;
+                  const text = (a.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 60);
+                  const key = href + '|' + text;
+                  if (seen.has(key)) continue;
+                  seen.add(key);
+                  links.push(text + '|' + href);
+                }
+                const invoke = window.__TAURI_INTERNALS__?.invoke;
+                if (typeof invoke === 'function' && links.length > 0) {
+                  invoke('report_page_links', { payload: { url: location.href, title: document.title, links: links.slice(0, 600) } }).catch(() => {});
+                }
+              } catch {}
+            };
             new MutationObserver(inspect).observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ['src'] });
             document.addEventListener('play', inspect, true);
+            window.addEventListener('load', () => setTimeout(extractAndSendLinks, 1500));
+            document.addEventListener('DOMContentLoaded', () => setTimeout(extractAndSendLinks, 1000));
             inspect();
           })();
         "#;
@@ -682,8 +758,15 @@ const EPISODE_SYSTEM_PROMPT: &str = r#"你是视频站点分析助手。用户�
 3. 按集数/顺序排列，尽量覆盖全部集数
 4. 只输出 JSON"#;
 
+/// Truncate long strings for log readability while keeping enough context to debug.
+fn truncate_for_log(text: &str, max_len: usize) -> String {
+    if text.chars().count() <= max_len { text.to_string() }
+    else { format!("{}…(共{}字符)", text.chars().take(max_len).collect::<String>(), text.chars().count()) }
+}
+
 async fn llm_chat(settings: &AppSettings, system: &str, user: &str) -> Result<String, String> {
     if settings.llm_api_url.is_empty() || settings.llm_model.is_empty() {
+        debug_log("[llm_chat] missing llm_api_url or llm_model in settings");
         return Err("请先在设置中配置 LLM API 地址和模型".to_string());
     }
     let endpoint = if settings.llm_api_url.ends_with("/chat/completions") {
@@ -691,6 +774,8 @@ async fn llm_chat(settings: &AppSettings, system: &str, user: &str) -> Result<St
     } else {
         format!("{}/chat/completions", settings.llm_api_url.trim_end_matches('/'))
     };
+    debug_log(&format!("[llm_chat] endpoint={endpoint} model={} user_len={}", settings.llm_model, user.len()));
+    debug_log(&format!("[llm_chat] user message: {}", truncate_for_log(user, 2000)));
     let mut headers = header::HeaderMap::new();
     if !settings.llm_api_key.is_empty() {
         headers.insert(header::AUTHORIZATION, header::HeaderValue::from_str(&format!("Bearer {}", settings.llm_api_key)).map_err(|error| error.to_string())?);
@@ -707,39 +792,66 @@ async fn llm_chat(settings: &AppSettings, system: &str, user: &str) -> Result<St
             {"role": "user", "content": user},
         ],
     });
-    let response = client.post(&endpoint).json(&body).send().await.map_err(|error| format!("LLM 请求失败: {error}"))?;
-    if !response.status().is_success() {
-        let status = response.status();
+    let response = match client.post(&endpoint).json(&body).send().await {
+        Ok(response) => response,
+        Err(error) => { debug_log(&format!("[llm_chat] request failed: {error}")); return Err(format!("LLM 请求失败: {error}")); }
+    };
+    let status = response.status();
+    debug_log(&format!("[llm_chat] response status: {status}"));
+    if !status.is_success() {
         let text = response.text().await.unwrap_or_default();
+        debug_log(&format!("[llm_chat] error body: {}", truncate_for_log(&text, 2000)));
         return Err(format!("LLM 返回 {status}: {text}"));
     }
-    let payload: serde_json::Value = response.json().await.map_err(|error| format!("LLM 响应解析失败: {error}"))?;
-    payload
+    let raw_text = response.text().await.map_err(|error| { debug_log(&format!("[llm_chat] failed to read response body: {error}")); format!("LLM 响应读取失败: {error}") })?;
+    debug_log(&format!("[llm_chat] raw response: {}", truncate_for_log(&raw_text, 2000)));
+    let payload: serde_json::Value = serde_json::from_str(&raw_text).map_err(|error| { debug_log(&format!("[llm_chat] JSON parse failed: {error}")); format!("LLM 响应解析失败: {error}") })?;
+    let content = payload
         .pointer("/choices/0/message/content")
         .and_then(|value| value.as_str())
         .map(|content| content.to_string())
-        .ok_or_else(|| "LLM 响应缺少 content".to_string())
+        .ok_or_else(|| "LLM 响应缺少 content".to_string())?;
+    debug_log(&format!("[llm_chat] content: {}", truncate_for_log(&content, 2000)));
+    Ok(content)
 }
 
 /// Extract the first JSON object from LLM output (handles ```json fences and prose around it).
 fn extract_llm_json(text: &str) -> Option<serde_json::Value> {
     let cleaned = if let Some(start) = text.find('{') {
-        let end = text.rfind('}')?;
+        let Some(end) = text.rfind('}') else { debug_log("[extract_llm_json] no closing brace found"); return None; };
         &text[start..=end]
-    } else { return None };
-    serde_json::from_str(cleaned).ok()
+    } else { debug_log("[extract_llm_json] no opening brace found"); return None; };
+    match serde_json::from_str(cleaned) {
+        Ok(value) => Some(value),
+        Err(error) => { debug_log(&format!("[extract_llm_json] JSON parse failed: {error}; cleaned={}", truncate_for_log(cleaned, 1000))); None }
+    }
 }
 
-/// Open a page in the headless browser and return (title, "text|href" link list) for LLM analysis.
-async fn fetch_page_context(browser: &Arc<Browser>, url: &str) -> Result<(String, String), String> {
-    let page = browser.new_page("about:blank").await.map_err(|error| format!("创建页面失败: {error}"))?;
+/// After a successful goto(), return the page's current URL if it differs from the requested one (i.e. a redirect happened).
+async fn detect_redirect(page: &chromiumoxide::Page, requested_url: &str) -> Option<String> {
+    match page.url().await {
+        Ok(Some(final_url)) if final_url != requested_url => Some(final_url),
+        _ => None,
+    }
+}
+
+/// Open a page in the headless browser and return (title, "text|href" link list, redirected_to) for LLM analysis.
+async fn fetch_page_context(browser: &Arc<Browser>, url: &str) -> Result<(String, String, Option<String>), String> {
+    debug_log(&format!("[fetch_page_context] url={url}"));
+    let page = browser.new_page("about:blank").await.map_err(|error| { debug_log(&format!("[fetch_page_context] new_page failed: {error}")); format!("创建页面失败: {error}") })?;
+    if let Err(error) = page.enable_stealth_mode().await { debug_log(&format!("[fetch_page_context] enable_stealth_mode failed: {error}")); }
     page.execute(chromiumoxide::cdp::browser_protocol::network::EnableParams::default()).await.map_err(|error| error.to_string())?;
     let goto = page.goto(url);
     match tokio::time::timeout(std::time::Duration::from_secs(30), goto).await {
-        Ok(Ok(_)) => {}
-        Ok(Err(error)) => return Err(format!("页面导航失败: {error}")),
-        Err(_) => {} // proceed even if navigation is slow — the DOM may still be usable
+        Ok(Ok(_)) => { debug_log("[fetch_page_context] navigation completed"); wait_for_challenge_page(&page, std::time::Duration::from_secs(12)).await; }
+        Ok(Err(error)) => { debug_log(&format!("[fetch_page_context] navigation error: {error}")); return Err(format!("页面导航失败: {error}")); }
+        Err(_) => { debug_log("[fetch_page_context] navigation timed out (30s), proceeding anyway"); } // proceed even if navigation is slow — the DOM may still be usable
     }
+    // Many listing/player pages redirect via JS (`location.href = ...`) or a meta-refresh
+    // *after* the initial document has loaded, not as a plain HTTP 301/302 — so goto() alone
+    // can resolve before that redirect fires. Extraction runs a little after goto returns
+    // (evaluate() itself takes a beat), so re-check the URL here, once the page has had a
+    // chance to settle, rather than immediately after goto.
     let extract_js = r#"(() => {
         const links = [];
         const seen = new Set();
@@ -752,43 +864,66 @@ async fn fetch_page_context(browser: &Arc<Browser>, url: &str) -> Result<(String
             seen.add(key);
             links.push(text + '|' + href);
         }
-        return JSON.stringify({ title: document.title, links: links.slice(0, 600) });
+        return JSON.stringify({ title: document.title, links: links.slice(0, 600), href: location.href });
     })()"#;
     let result = tokio::time::timeout(std::time::Duration::from_secs(10), page.evaluate(extract_js)).await
-        .map_err(|_| "页面内容提取超时".to_string())?
-        .map_err(|error| format!("页面内容提取失败: {error}"))?;
+        .map_err(|_| { debug_log("[fetch_page_context] extraction timed out (10s)"); "页面内容提取超时".to_string() })?
+        .map_err(|error| { debug_log(&format!("[fetch_page_context] extraction failed: {error}")); format!("页面内容提取失败: {error}") })?;
     let value: String = result.into_value().map_err(|error| error.to_string())?;
+    let redirected_to = detect_redirect(&page, url).await;
     let _ = page.close().await;
     let parsed: serde_json::Value = serde_json::from_str(&value).map_err(|error| error.to_string())?;
     let title = parsed["title"].as_str().unwrap_or_default().to_string();
     let links = parsed["links"].as_array().cloned().unwrap_or_default()
         .iter().filter_map(|link| link.as_str()).collect::<Vec<_>>().join("\n");
-    Ok((title, links))
+    // Prefer location.href (reflects any JS redirect the page made while rendering) over the
+    // CDP-reported page.url(), falling back to the latter if the script result is unusable.
+    let final_href = parsed["href"].as_str().filter(|href| !href.is_empty()).map(|href| href.to_string());
+    let redirected_to = match final_href {
+        Some(href) if href != url => Some(href),
+        Some(_) => None,
+        None => redirected_to,
+    };
+    debug_log(&format!("[fetch_page_context] title={title:?} link_count={} redirected_to={:?}", links.lines().count(), redirected_to));
+    Ok((title, links, redirected_to))
 }
 
 /// ReAct loop: open pages and let the LLM find episode play-page URLs.
 #[tauri::command]
 async fn analyze_episodes(app: AppHandle, state: tauri::State<'_, AppState>, url: String) -> Result<AnalyzeResult, String> {
-    if !is_allowed_url(&url) { return Err("请输入有效的 http 或 https 网页地址".to_string()); }
+    debug_log(&format!("[analyze_episodes] start url={url}"));
+    if !is_allowed_url(&url) { debug_log(&format!("[analyze_episodes] rejected invalid url: {url}")); return Err("请输入有效的 http 或 https 网页地址".to_string()); }
     let settings = state.settings.read().await.clone();
     ensure_headless_browser(&app, &state, &settings).await?;
     let browser = state.headless_browser.lock().await.clone().ok_or("Chromium 初始化失败")?;
 
     let mut steps = Vec::new();
     let mut current_url = url;
+    let mut last_error: Option<String> = None;
     for round in 1..=6u32 {
+        debug_log(&format!("[analyze_episodes] round {round} current_url={current_url}"));
         let _ = app.emit("batch-progress", BatchProgress { stage: "analyzing".into(), message: format!("第 {round} 轮：打开页面并提取链接…"), current: Some(round as u64), total: Some(6) });
-        let (title, links) = fetch_page_context(&browser, &current_url).await?;
-        if links.is_empty() { return Err(format!("页面「{title}」没有提取到任何链接")); }
+        let (title, links, redirected_to) = fetch_page_context(&browser, &current_url).await
+            .map_err(|error| { debug_log(&format!("[analyze_episodes] round {round} fetch_page_context failed: {error}")); format!("第 {round} 轮打开 {current_url} 失败：{error}") })?;
+        if links.is_empty() { debug_log(&format!("[analyze_episodes] round {round} no links extracted")); return Err(format!("第 {round} 轮：页面「{title}」（{current_url}）没有提取到任何链接")); }
+        if let Some(final_url) = redirected_to {
+            steps.push(format!("检测到页面跳转：{current_url} → {final_url}"));
+            current_url = final_url;
+        }
         steps.push(format!("第 {round} 轮：打开 {current_url}（标题：{title}，{lines} 个链接）", lines = links.lines().count()));
 
         let user_message = format!("页面 URL: {current_url}\n页面标题: {title}\n\n链接列表（格式 文本|URL）：\n{links}");
         let _ = app.emit("batch-progress", BatchProgress { stage: "analyzing".into(), message: format!("第 {round} 轮：LLM 分析 {lines} 个链接…", lines = links.lines().count()), current: Some(round as u64), total: Some(6) });
-        let reply = llm_chat(&settings, EPISODE_SYSTEM_PROMPT, &user_message).await?;
+        let reply = llm_chat(&settings, EPISODE_SYSTEM_PROMPT, &user_message).await
+            .map_err(|error| { debug_log(&format!("[analyze_episodes] round {round} llm_chat failed: {error}")); format!("第 {round} 轮 AI 分析失败：{error}") })?;
         let Some(json) = extract_llm_json(&reply) else {
-            steps.push(format!("第 {round} 轮：LLM 输出无法解析为 JSON，重试中"));
+            let message = format!("第 {round} 轮：LLM 输出无法解析为 JSON，重试中");
+            debug_log(&format!("[analyze_episodes] round {round} unparsable LLM reply: {}", truncate_for_log(&reply, 1000)));
+            steps.push(message.clone());
+            last_error = Some(format!("第 {round} 轮 AI 分析失败：LLM 输出无法解析为 JSON"));
             continue;
         };
+        debug_log(&format!("[analyze_episodes] round {round} action={:?}", json["action"].as_str()));
         match json["action"].as_str().unwrap_or_default() {
             "done" => {
                 let episodes = json["episodes"].as_array().cloned().unwrap_or_default().iter().filter_map(|item| {
@@ -798,7 +933,8 @@ async fn analyze_episodes(app: AppHandle, state: tauri::State<'_, AppState>, url
                         .unwrap_or_else(|| url.rsplit('/').next().unwrap_or("剧集").to_string());
                     Some(Episode { title, url })
                 }).collect::<Vec<_>>();
-                if episodes.is_empty() { return Err("LLM 没有找到任何剧集链接".to_string()); }
+                if episodes.is_empty() { debug_log(&format!("[analyze_episodes] round {round} action=done but 0 valid episodes")); return Err(format!("第 {round} 轮：AI 判定完成但没有找到任何有效的剧集链接")); }
+                debug_log(&format!("[analyze_episodes] done: {} episodes found", episodes.len()));
                 steps.push(format!("分析完成：找到 {} 集", episodes.len()));
                 let _ = app.emit("batch-progress", BatchProgress { stage: "analyzing".into(), message: format!("找到 {} 集", episodes.len()), current: None, total: None });
                 return Ok(AnalyzeResult { episodes, steps });
@@ -806,22 +942,26 @@ async fn analyze_episodes(app: AppHandle, state: tauri::State<'_, AppState>, url
             "open" => {
                 let next = json["url"].as_str().unwrap_or_default().to_string();
                 let reason = json["reason"].as_str().unwrap_or_default().to_string();
-                if !is_allowed_url(&next) { return Err(format!("LLM 要求打开非法地址: {next}")); }
+                if !is_allowed_url(&next) { debug_log(&format!("[analyze_episodes] round {round} action=open invalid url: {next}")); return Err(format!("第 {round} 轮：AI 要求打开非法地址: {next}")); }
                 steps.push(format!("第 {round} 轮：需要打开 {next}（{reason}）"));
                 current_url = next;
             }
             _ => {
                 let reason = json["reason"].as_str().unwrap_or("LLM 未能识别页面结构");
-                return Err(format!("分析失败：{reason}"));
+                debug_log(&format!("[analyze_episodes] round {round} action=fail/unknown reason={reason}"));
+                return Err(format!("第 {round} 轮 AI 判定失败：{reason}"));
             }
         }
     }
-    Err("分析轮数已达上限（6 轮），未能确定剧集列表".to_string())
+    debug_log("[analyze_episodes] exhausted 6 rounds without resolution");
+    Err(last_error.unwrap_or_else(|| "分析轮数已达上限（6 轮），未能确定剧集列表".to_string()))
 }
 
-/// Open one episode page in the headless browser and capture its media (playlist) URL.
-async fn capture_episode_media(browser: &Arc<Browser>, page_url: &str) -> Result<Option<String>, String> {
-    let page = browser.new_page("about:blank").await.map_err(|error| format!("创建页面失败: {error}"))?;
+/// Open one episode page in the headless browser and capture its media (playlist) URL and any redirect.
+async fn capture_episode_media(browser: &Arc<Browser>, page_url: &str) -> Result<(Option<String>, Option<String>), String> {
+    debug_log(&format!("[capture_episode_media] page_url={page_url}"));
+    let page = browser.new_page("about:blank").await.map_err(|error| { debug_log(&format!("[capture_episode_media] new_page failed: {error}")); format!("创建页面失败: {error}") })?;
+    if let Err(error) = page.enable_stealth_mode().await { debug_log(&format!("[capture_episode_media] enable_stealth_mode failed: {error}")); }
     page.evaluate_on_new_document("document.addEventListener('DOMContentLoaded', () => document.querySelectorAll('video').forEach(video => { video.muted = true; video.play().catch(() => {}); }));").await.map_err(|error| error.to_string())?;
     page.execute(chromiumoxide::cdp::browser_protocol::network::EnableParams::default()).await.map_err(|error| error.to_string())?;
     let mut requests = page.event_listener::<chromiumoxide::cdp::browser_protocol::network::EventRequestWillBeSent>().await.map_err(|error| error.to_string())?;
@@ -855,9 +995,9 @@ async fn capture_episode_media(browser: &Arc<Browser>, page_url: &str) -> Result
 
     let goto = page.goto(page_url);
     match tokio::time::timeout(std::time::Duration::from_secs(30), goto).await {
-        Ok(Ok(_)) => {}
-        Ok(Err(error)) => { let _ = page.close().await; return Err(format!("页面导航失败: {error}")); }
-        Err(_) => {}
+        Ok(Ok(_)) => { debug_log("[capture_episode_media] navigation completed"); wait_for_challenge_page(&page, std::time::Duration::from_secs(20)).await; }
+        Ok(Err(error)) => { debug_log(&format!("[capture_episode_media] navigation error: {error}")); let _ = page.close().await; return Err(format!("页面导航失败: {error}")); }
+        Err(_) => { debug_log("[capture_episode_media] navigation timed out (30s), proceeding anyway"); }
     }
     // Collect media for up to 15s; return as soon as a playlist shows up.
     let result = tokio::time::timeout(std::time::Duration::from_secs(15), async {
@@ -868,13 +1008,19 @@ async fn capture_episode_media(browser: &Arc<Browser>, page_url: &str) -> Result
         }
         first
     }).await.unwrap_or(None);
+    // Re-check the URL only after media collection finishes (not right after goto): episode
+    // pages commonly redirect via JS (`location.href = ...`) a moment after the initial
+    // document loads, which goto() alone would miss.
+    let redirected_to = detect_redirect(&page, page_url).await;
     let _ = page.close().await;
-    Ok(result)
+    debug_log(&format!("[capture_episode_media] result={result:?} redirected_to={redirected_to:?}"));
+    Ok((result, redirected_to))
 }
 
 /// Probe every episode page, capture its media URL, and queue downloads.
 #[tauri::command]
 async fn batch_download(app: AppHandle, state: tauri::State<'_, AppState>, episodes: Vec<Episode>) -> Result<(), String> {
+    debug_log(&format!("[batch_download] starting with {} episodes", episodes.len()));
     if episodes.is_empty() { return Err("剧集列表为空".to_string()); }
     let settings = state.settings.read().await.clone();
     let output_dir = app_download_dir(&app, &settings)?;
@@ -891,15 +1037,21 @@ async fn batch_download(app: AppHandle, state: tauri::State<'_, AppState>, episo
             total: Some(total),
         });
         match capture_episode_media(&browser, &episode.url).await {
-            Ok(Some(media_url)) => {
+            Ok((Some(media_url), redirected_to)) => {
                 captured += 1;
-                debug_log(&format!("[batch] episode '{}' -> {media_url}", episode.title));
-                let _ = emit_captured(&app, &state, media_url.clone(), episode.url.clone(), None);
+                // If the episode page redirected (e.g. through an auth/CDN hop), the media's
+                // Referer must be the real page that ended up loading it — otherwise some CDNs
+                // reject the request as a referer mismatch. Same applies to the source_url we
+                // record for this captured item.
+                let effective_page_url = redirected_to.clone().unwrap_or_else(|| episode.url.clone());
+                let redirect_note = redirected_to.as_deref().map(|u| format!("（页面跳转至 {u}）")).unwrap_or_default();
+                debug_log(&format!("[batch] episode '{}' -> {media_url}{redirect_note}", episode.title));
+                let _ = emit_captured(&app, &state, media_url.clone(), effective_page_url.clone(), None);
                 let payload = DownloadRequest {
                     id: format!("batch-{}-{}", chrono_time(), index),
                     url: media_url,
                     filename: format!("{}.ts", episode.title),
-                    referer: Some(episode.url.clone()),
+                    referer: Some(effective_page_url),
                 };
                 let cancel = Arc::new(tokio::sync::Mutex::new(false));
                 state.downloads.lock().map_err(|_| "下载队列锁定失败".to_string())?.insert(payload.id.clone(), cancel.clone());
@@ -913,26 +1065,74 @@ async fn batch_download(app: AppHandle, state: tauri::State<'_, AppState>, episo
                     }
                 });
             }
-            Ok(None) => debug_log(&format!("[batch] episode '{}' captured no media", episode.title)),
-            Err(error) => debug_log(&format!("[batch] episode '{}' failed: {error}", episode.title)),
+            Ok((None, _)) => {
+                let message = format!("「{}」未探测到播放地址（可能是页面未播放或未使用 m3u8/mpd 格式）", episode.title);
+                debug_log(&format!("[batch] {message}"));
+                let _ = app.emit("batch-progress", BatchProgress { stage: "capturing".into(), message, current: Some(index as u64 + 1), total: Some(total) });
+            }
+            Err(error) => {
+                let message = format!("「{}」探测失败：{error}", episode.title);
+                debug_log(&format!("[batch] {message}"));
+                let _ = app.emit("batch-progress", BatchProgress { stage: "capturing".into(), message, current: Some(index as u64 + 1), total: Some(total) });
+            }
         }
     }
     let _ = app.emit("batch-progress", BatchProgress { stage: "done".into(), message: format!("完成：{captured}/{total} 集已加入下载", captured = captured, total = total), current: Some(captured), total: Some(total) });
     Ok(())
 }
 
+#[tauri::command]
+async fn analyze_page_links(app: AppHandle, state: tauri::State<'_, AppState>, url: String, html_or_links: String) -> Result<AnalyzeResult, String> {
+    let settings = state.settings.read().await.clone();
+    let lines = html_or_links.lines().count();
+    let user_message = format!("页面 URL: {url}\n\n链接列表（格式 文本|URL）：\n{html_or_links}");
+    let _ = app.emit("batch-progress", BatchProgress { stage: "analyzing".into(), message: format!("LLM 正在分析 {lines} 个链接…"), current: Some(1), total: Some(1) });
+    let reply = llm_chat(&settings, EPISODE_SYSTEM_PROMPT, &user_message).await
+        .map_err(|error| format!("AI 分析失败：{error}"))?;
+    let Some(json) = extract_llm_json(&reply) else {
+        return Err("LLM 输出无法解析为 JSON".to_string());
+    };
+    match json["action"].as_str().unwrap_or_default() {
+        "done" => {
+            let episodes = json["episodes"].as_array().cloned().unwrap_or_default().iter().filter_map(|item| {
+                let url = item["url"].as_str()?.to_string();
+                if !is_allowed_url(&url) { return None; }
+                let title = item["title"].as_str().map(|value| value.to_string())
+                    .unwrap_or_else(|| url.rsplit('/').next().unwrap_or("剧集").to_string());
+                Some(Episode { title, url })
+            }).collect::<Vec<_>>();
+            if episodes.is_empty() { return Err("AI 判定完成但没有找到任何有效的剧集链接".to_string()); }
+            let steps = vec![format!("从页面提取到 {} 个链接，AI 成功解析出 {} 集", lines, episodes.len())];
+            let _ = app.emit("batch-progress", BatchProgress { stage: "analyzing".into(), message: format!("找到 {} 集", episodes.len()), current: None, total: None });
+            Ok(AnalyzeResult { episodes, steps })
+        }
+        _ => {
+            let reason = json["reason"].as_str().unwrap_or("未能从提供的链接中识别出剧集");
+            Err(format!("AI 分析失败：{reason}"))
+        }
+    }
+}
+
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
             let settings_path = app.path().app_config_dir()?.join("settings.json");
-            let settings = std::fs::read(&settings_path)
+            debug_log(&format!("[setup] settings_path: {}", settings_path.display()));
+            let read_result = std::fs::read(&settings_path);
+            debug_log(&format!("[setup] read ok: {} err: {:?}", read_result.is_ok(), read_result.as_ref().err()));
+            let settings: AppSettings = read_result
                 .ok()
-                .and_then(|contents| serde_json::from_slice(&contents).ok())
+                .and_then(|contents| {
+                    let parsed = serde_json::from_slice::<AppSettings>(&contents);
+                    debug_log(&format!("[setup] parse ok: {} err: {:?}", parsed.is_ok(), parsed.as_ref().err()));
+                    parsed.ok()
+                })
                 .unwrap_or_default();
+            debug_log(&format!("[setup] loaded llmApiUrl: {:?}", settings.llm_api_url));
             app.manage(AppState::new(settings, settings_path));
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![open_page, open_visible_page, capture_media, get_media, get_settings, save_settings, start_download, cancel_download, clear_media, analyze_episodes, batch_download])
+        .invoke_handler(tauri::generate_handler![open_page, open_visible_page, capture_media, report_page_links, get_media, get_settings, save_settings, start_download, cancel_download, clear_media, analyze_episodes, analyze_page_links, batch_download])
         .run(tauri::generate_context!("Tauri.toml"))
         .expect("Video Scout failed to start");
 }

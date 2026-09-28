@@ -60,7 +60,12 @@ app.innerHTML = `
       </div>
       <div id="batch-view" hidden>
         <div class="task-heading"><div class="eyebrow"><span class="eyebrow-line"></span>BATCH MODE · LLM</div><h1>批量下载</h1><p>输入剧集列表页地址，由 LLM 分析页面找出全部集数并统一下载。需先在设置中配置 LLM。</p></div>
-        <form id="batch-form" class="url-form"><span class="url-icon">≡</span><input id="batch-url-input" type="url" placeholder="https://example.com/drama/123" autocomplete="url" required><button type="submit" id="batch-analyze-btn">分析剧集 <span>→</span></button></form>
+        <form id="batch-form" class="url-form">
+          <span class="url-icon">≡</span>
+          <input id="batch-url-input" type="url" placeholder="https://example.com/drama/123" autocomplete="url" required>
+          <button type="submit" id="batch-analyze-btn">无头分析 <span>→</span></button>
+          <button type="button" id="batch-open-visible-btn" class="quiet-button batch-visible-trigger" title="遇到 Cloudflare 盾时，在可视原生窗口中打开该页面手动过验证并提取集数">用可视窗口打开并提取</button>
+        </form>
         <div id="batch-progress" class="batch-progress" hidden></div>
         <section class="media-section" id="batch-result-section" hidden><div class="section-head"><div><div class="section-kicker">分析结果</div><h2>共 <span id="batch-count">0</span> 集</h2></div><div class="section-tools"><label class="batch-select-all"><input type="checkbox" id="batch-select-all" checked>全选</label><button id="batch-download-btn" class="save-settings">开始下载全部</button></div></div><div id="batch-list" class="batch-list"></div></section>
       </div>
@@ -361,8 +366,6 @@ document.querySelector<HTMLFormElement>("#batch-form")!.addEventListener("submit
   if (batchBusy) return;
   const input = document.querySelector<HTMLInputElement>("#batch-url-input")!;
   const button = document.querySelector<HTMLButtonElement>("#batch-analyze-btn")!;
-  const url = formatUrl(input.value);
-  if (!url) return;
   batchBusy = true;
   button.disabled = true;
   button.innerHTML = '分析中… <span class="spin">⟳</span>';
@@ -370,6 +373,7 @@ document.querySelector<HTMLFormElement>("#batch-form")!.addEventListener("submit
   renderEpisodes();
   showBatchProgress("正在启动分析…");
   try {
+    const url = formatUrl(input.value);
     const result = await invoke<{ episodes: Episode[]; steps: string[] }>("analyze_episodes", { url });
     episodes = result.episodes;
     renderEpisodes();
@@ -382,6 +386,55 @@ document.querySelector<HTMLFormElement>("#batch-form")!.addEventListener("submit
     button.innerHTML = "分析剧集 <span>→</span>";
   }
 });
+
+document.querySelector<HTMLButtonElement>("#batch-open-visible-btn")!.addEventListener("click", async () => {
+  const input = document.querySelector<HTMLInputElement>("#batch-url-input")!;
+  if (!input.value.trim()) {
+    input.reportValidity();
+    return;
+  }
+  try {
+    const url = formatUrl(input.value);
+    input.value = url;
+    showBatchProgress("已在原生窗口打开页面。如有 Cloudflare 验证请手动点击，页面完全加载后会自动提取剧集列表…");
+    await invoke("open_visible_page", { url });
+  } catch (error) {
+    showBatchProgress(`打开页面失败：${String(error)}`, true);
+  }
+});
+
+let unlistenPageLinks: UnlistenFn | undefined;
+
+async function handlePageLinks(payload: { url: string; title: string; links: string[] }) {
+  // If the batch tab isn't active or no links, don't spam
+  if (payload.links.length === 0) return;
+  // If user is currently looking at Cloudflare challenge, ignore
+  const lowerTitle = payload.title.toLowerCase();
+  if (lowerTitle.includes("请稍候") || lowerTitle.includes("just a moment") || lowerTitle.includes("checking your browser")) {
+    showBatchProgress(`页面正在通过验证（${payload.title}），请稍候…`);
+    return;
+  }
+  showBatchProgress(`检测到页面「${payload.title}」已加载（共 ${payload.links.length} 个链接），正在呼叫 LLM 分析剧集…`);
+  try {
+    batchBusy = true;
+    const button = document.querySelector<HTMLButtonElement>("#batch-analyze-btn")!;
+    button.disabled = true;
+    const linksText = payload.links.join("\n");
+    const result = await invoke<{ episodes: Episode[]; steps: string[] }>("analyze_page_links", {
+      url: payload.url,
+      htmlOrLinks: linksText,
+    });
+    episodes = result.episodes;
+    renderEpisodes();
+    showBatchProgress(`分析完成：共 ${result.episodes.length} 集！勾选确认后点击下方按钮开始下载。`);
+  } catch (error) {
+    showBatchProgress(`从可见窗口提取分析失败：${String(error)}`, true);
+  } finally {
+    batchBusy = false;
+    const button = document.querySelector<HTMLButtonElement>("#batch-analyze-btn")!;
+    button.disabled = false;
+  }
+}
 
 document.querySelector<HTMLButtonElement>("#batch-download-btn")!.addEventListener("click", async () => {
   if (batchBusy || episodes.length === 0) return;
@@ -426,10 +479,18 @@ document.querySelectorAll<HTMLButtonElement>(".nav-item").forEach((button) => bu
 async function initialize() {
   unlistenMedia = await listen<MediaItem>("media-found", ({ payload }) => { media.set(payload.id, payload); renderMedia(); });
   unlistenProgress = await listen<DownloadUpdate>("download-progress", ({ payload }) => {
-    const task = tasks.get(payload.id);
-    if (!task) return;
-    Object.assign(task, payload);
+    const existing = tasks.get(payload.id);
+    if (existing) {
+      Object.assign(existing, payload);
+    } else {
+      // Tasks queued by the backend (batch download) have no frontend-created
+      // entry, so adopt them on their first progress event.
+      tasks.set(payload.id, { sourceUrl: "", ...payload });
+    }
     renderTasks();
+  });
+  unlistenPageLinks = await listen<{ url: string; title: string; links: string[] }>("browser-page-links", ({ payload }) => {
+    void handlePageLinks(payload);
   });
   const [existing, settings] = await Promise.all([
     invoke<MediaItem[]>("get_media"),
@@ -446,7 +507,7 @@ async function initialize() {
   updateBrowserSourceFields();
   renderMedia();
   renderTasks();
-  window.addEventListener("beforeunload", () => { unlistenMedia?.(); unlistenProgress?.(); });
+  window.addEventListener("beforeunload", () => { unlistenMedia?.(); unlistenProgress?.(); unlistenPageLinks?.(); });
 }
 
 void initialize();

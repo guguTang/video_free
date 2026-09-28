@@ -21,3 +21,5 @@
 .batch-url{font:400 10px 'DM Sans',sans-serif;color:#8d95a6;direction:rtl;text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .batch-select-all{display:flex;align-items:center;gap:6px;font:600 11px 'DM Sans',sans-serif;color:#6b7889;cursor:pointer}
 .batch-select-all input{accent-color:#426bdb}
+.batch-visible-trigger{height:42px;padding:0 14px;border:1px solid #d0d9e8;border-radius:7px;background:#f3f6fc;color:#3d5280;font:600 12px 'DM Sans',sans-serif;cursor:pointer;white-space:nowrap}
+.batch-visible-trigger:hover{background:#e6edf9;border-color:#b9c8e2;color:#273d6b}
