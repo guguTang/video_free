@@ -5,10 +5,11 @@ use cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
 use futures_util::StreamExt;
 use reqwest::{header, Client, Url};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, path::PathBuf, sync::{Arc, Mutex}};
+use std::{collections::{HashMap, VecDeque}, path::PathBuf, sync::{Arc, Mutex}};
 use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 use tokio::sync::RwLock;
-use tokio::{fs::File, io::AsyncWriteExt};
+use tokio::fs::{File, OpenOptions};
+use tokio::io::AsyncWriteExt;
 
 fn debug_log(msg: &str) {
     use std::io::Write;
@@ -71,7 +72,7 @@ struct CaptureRequest {
     source_url: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DownloadRequest {
     id: String,
@@ -82,9 +83,35 @@ struct DownloadRequest {
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
+struct TaskRecord {
+    id: String,
+    url: String,
+    filename: String,
+    #[serde(default)]
+    referer: Option<String>,
+    #[serde(default)]
+    subdir: Option<String>,
+    status: String,
+    #[serde(default)]
+    received: u64,
+    #[serde(default)]
+    total: Option<u64>,
+    #[serde(default)]
+    unit: Option<String>,
+    #[serde(default)]
+    received_bytes: Option<u64>,
+    #[serde(default)]
+    total_bytes: Option<u64>,
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    created_at: String,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct AppSettings {
     browser_source: String,
-    listening_mode: String,
     local_chromium_path: String,
     #[serde(default)]
     download_dir: String,
@@ -94,38 +121,68 @@ struct AppSettings {
     llm_api_key: String,
     #[serde(default)]
     llm_model: String,
+    #[serde(default = "default_max_concurrent")]
+    max_concurrent: u32,
+    #[serde(default)]
+    lan_enabled: bool,
+    #[serde(default = "default_lan_port")]
+    lan_port: u32,
 }
+
+fn default_max_concurrent() -> u32 { 3 }
+fn default_lan_port() -> u32 { 8688 }
 
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
             browser_source: "managed".into(),
-            listening_mode: "headless".into(),
             local_chromium_path: String::new(),
             download_dir: String::new(),
             llm_api_url: String::new(),
             llm_api_key: String::new(),
             llm_model: String::new(),
+            max_concurrent: 3,
+            lan_enabled: false,
+            lan_port: 8688,
         }
     }
+}
+
+struct LanServer {
+    port: u32,
+    server: Arc<tiny_http::Server>,
+}
+
+struct QueuedDownload {
+    payload: DownloadRequest,
+    output_dir: PathBuf,
+    resume: Option<(u64, u64)>,
 }
 
 struct AppState {
     media: Mutex<HashMap<String, MediaItem>>,
     downloads: Mutex<HashMap<String, Arc<tokio::sync::Mutex<bool>>>>,
+    download_queue: Mutex<VecDeque<QueuedDownload>>,
+    tasks: Mutex<HashMap<String, TaskRecord>>,
+    tasks_path: PathBuf,
     settings: RwLock<AppSettings>,
   settings_path: PathBuf,
+    lan_server: Mutex<Option<Arc<LanServer>>>,
     headless_page_url: Mutex<String>,
     headless_browser: tokio::sync::Mutex<Option<Arc<Browser>>>,
 }
 
 impl AppState {
-   fn new(settings: AppSettings, settings_path: PathBuf) -> Self {
+   fn new(settings: AppSettings, settings_path: PathBuf, tasks: HashMap<String, TaskRecord>, tasks_path: PathBuf) -> Self {
         Self {
             media: Mutex::default(),
             downloads: Mutex::default(),
+            download_queue: Mutex::default(),
+            tasks: Mutex::new(tasks),
+            tasks_path,
             settings: RwLock::new(settings),
             settings_path,
+            lan_server: Mutex::default(),
             headless_page_url: Mutex::default(),
             headless_browser: tokio::sync::Mutex::new(None),
         }
@@ -148,7 +205,33 @@ fn is_allowed_url(url: &str) -> bool {
     Url::parse(url).map(|parsed| matches!(parsed.scheme(), "http" | "https")).unwrap_or(false)
 }
 
+fn save_tasks_locked(tasks: &HashMap<String, TaskRecord>, path: &PathBuf) {
+    let mut records: Vec<&TaskRecord> = tasks.values().collect();
+    records.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+    match serde_json::to_vec_pretty(&records) {
+        Ok(json) => { if let Err(error) = std::fs::write(path, json) { debug_log(&format!("[tasks] save failed: {error}")); } }
+        Err(error) => debug_log(&format!("[tasks] serialize failed: {error}")),
+    }
+}
+
 fn emit_download(app: &AppHandle, update: DownloadUpdate) {
+    // 同步更新持久化任务记录：状态变化必落盘；下载中仅 HLS 分片边界落盘（直链逐 chunk 太频繁）
+    let state = app.state::<AppState>();
+    if let Ok(mut tasks) = state.tasks.lock() {
+        if let Some(record) = tasks.get_mut(&update.id) {
+            record.status = update.status.clone();
+            record.filename = update.filename.clone();
+            record.received = update.received;
+            record.total = update.total;
+            record.unit = update.unit.clone();
+            record.received_bytes = update.received_bytes;
+            record.total_bytes = update.total_bytes;
+            record.error = update.error.clone();
+            if update.status != "downloading" || update.unit.as_deref() == Some("segments") {
+                save_tasks_locked(&tasks, &state.tasks_path);
+            }
+        }
+    }
     let _ = app.emit("download-progress", update);
 }
 
@@ -195,6 +278,11 @@ fn emit_captured(app: &AppHandle, state: &AppState, url: String, source_url: Str
     state.media.lock().map_err(|_| "媒体列表锁定失败".to_string())?.insert(item.id.clone(), item.clone());
     let emit_result = app.emit("media-found", item);
     debug_log(&format!("[emit_captured] emit result: {:?}", emit_result.is_ok()));
+    // 探测成功后自动关闭可视探测窗口（无头模式没有该窗口，get 返回 None）
+    if let Some(window) = app.get_webview_window("browser") {
+        debug_log("[emit_captured] media found, closing browser window");
+        let _ = window.close();
+    }
     Ok(())
 }
 
@@ -403,6 +491,13 @@ async fn open_headless_page(app: AppHandle, state: &AppState, url: &str, setting
                     }
                 }
             }
+            // 网络监听和 DOM 扫描都会漏掉藏在播放器配置里的分享链接（无媒体扩展名，需二次请求解析），
+            // 用与可视窗口相同的 Rust 侧静态解析兜底
+            let (rust_found, page_title) = scan_page_html_for_media(&source_url).await;
+            for media_url in rust_found {
+                debug_log(&format!("[open_headless_page] rust scan found: {media_url}"));
+                let _ = emit_captured(&app, state, media_url, source_url.clone(), None, page_title.as_deref());
+            }
         }
         Ok(Err(error)) => {
             debug_log(&format!("[open_headless_page] navigation error: {error}"));
@@ -414,10 +509,25 @@ async fn open_headless_page(app: AppHandle, state: &AppState, url: &str, setting
 }
 
 async fn open_visible_page_inner(app: AppHandle, _state: &AppState, url: String) -> Result<(), String> {
+    let parsed = Url::parse(&url).map_err(|error| error.to_string())?;
+    // Reuse the existing "browser" window: close() is async on macOS, so close+rebuild
+    // races and intermittently fails with "label already exists", which the user sees
+    // as a probe error.
+    let mut skip_build = false;
     if let Some(window) = app.get_webview_window("browser") {
-        let _ = window.close();
+        match window.navigate(parsed.clone()) {
+            Ok(()) => {
+                debug_log("[open_visible_page] reusing existing window via navigate");
+                skip_build = true;
+            }
+            Err(error) => {
+                debug_log(&format!("[open_visible_page] navigate failed, rebuilding window: {error}"));
+                let _ = window.close();
+                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            }
+        }
     }
-    {
+    if !skip_build {
         let initialization_script = r#"
           (() => {
             const vlog = (msg) => { try { window.__TAURI_INTERNALS__?.invoke('visible_log', { message: '[' + location.href.slice(0, 80) + '] ' + msg }).catch(() => {}); } catch {} };
@@ -518,7 +628,7 @@ async fn open_visible_page_inner(app: AppHandle, _state: &AppState, url: String)
             scanHtmlForMedia();
           })();
         "#;
-        WebviewWindowBuilder::new(&app, "browser", WebviewUrl::External(Url::parse(&url).map_err(|error| error.to_string())?))
+        WebviewWindowBuilder::new(&app, "browser", WebviewUrl::External(parsed))
             .title("页面探测器")
             .inner_size(1100.0, 760.0)
             .visible(true)
@@ -550,7 +660,7 @@ async fn open_visible_page_inner(app: AppHandle, _state: &AppState, url: String)
                 }
             })
             .build()
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| { debug_log(&format!("[open_visible_page] window build failed: {error}")); error.to_string() })?;
     }
     // Also scan the page HTML from Rust side (bypasses JS injection issues)
     let scan_url = url.clone();
@@ -573,6 +683,7 @@ async fn open_visible_page_inner(app: AppHandle, _state: &AppState, url: String)
 async fn scan_page_html_for_media(url: &str) -> (Vec<String>, Option<String>) {
     let client = match Client::builder()
         .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+        .timeout(std::time::Duration::from_secs(20))
         .build() {
         Ok(c) => c,
         Err(e) => { debug_log(&format!("[scan_page_html_for_media] client build failed: {e}")); return (vec![], None); }
@@ -622,7 +733,7 @@ async fn scan_page_html_for_media(url: &str) -> (Vec<String>, Option<String>) {
     // The URL here is the real playable source, more reliable than regex-scanning the HTML.
     let (player_url, player_title) = extract_player_info(&unescaped);
     let resolved_url = if let Some(ref purl) = player_url {
-        resolve_share_url(&client, purl).await.or_else(|| Some(purl.clone()))
+        resolve_share_url(&client, purl, url).await.or_else(|| Some(purl.clone()))
     } else {
         None
     };
@@ -641,31 +752,35 @@ async fn scan_page_html_for_media(url: &str) -> (Vec<String>, Option<String>) {
 
 /// If a player URL is a "share" link (e.g. `https://vip.ffzy-plays.com/share/...`),
 /// fetch the share page and extract the real m3u8 URL from its JS variables.
-async fn resolve_share_url(client: &Client, url: &str) -> Option<String> {
+async fn resolve_share_url(client: &Client, url: &str, referer: &str) -> Option<String> {
     if !url.contains("/share/") {
         debug_log(&format!("[resolve_share_url] not a share URL: {url}"));
         return None;
     }
     debug_log(&format!("[resolve_share_url] resolving: {url}"));
-    let response = match client.get(url).send().await {
-        Ok(r) => r,
-        Err(e) => {
-            debug_log(&format!("[resolve_share_url] fetch failed: {e}"));
-            return None;
+    // The share host rejects or drops some direct requests; retry a few times
+    // with the play page as Referer, like a real browser would send.
+    let mut html: Option<String> = None;
+    for attempt in 1..=3u8 {
+        if attempt > 1 {
+            debug_log(&format!("[resolve_share_url] retry attempt {attempt}"));
+            tokio::time::sleep(std::time::Duration::from_millis(800)).await;
         }
-    };
-    if !response.status().is_success() {
-        debug_log(&format!("[resolve_share_url] status={}", response.status()));
-        return None;
+        let mut request = client.get(url);
+        if !referer.is_empty() { request = request.header(header::REFERER, referer); }
+        match request.send().await {
+            Ok(response) if response.status().is_success() => {
+                match response.text().await {
+                    Ok(text) if !text.trim().is_empty() => { debug_log(&format!("[resolve_share_url] html length={}", text.len())); html = Some(text); break; }
+                    Ok(_) => debug_log("[resolve_share_url] empty body"),
+                    Err(e) => debug_log(&format!("[resolve_share_url] read body failed: {e}")),
+                }
+            }
+            Ok(response) => debug_log(&format!("[resolve_share_url] status={}", response.status())),
+            Err(e) => debug_log(&format!("[resolve_share_url] fetch failed: {e}")),
+        }
     }
-    let html = match response.text().await {
-        Ok(t) => t,
-        Err(e) => {
-            debug_log(&format!("[resolve_share_url] read body failed: {e}"));
-            return None;
-        }
-    };
-    debug_log(&format!("[resolve_share_url] html length={}", html.len()));
+    let html = html?;
     let unescaped = html.replace("\\/", "/");
     let re = match regex::Regex::new(r#"(?i)const\s+url\s*=\s*"([^"]+\.m3u8[^"]*)""#) {
         Ok(r) => r,
@@ -731,12 +846,8 @@ fn extract_page_title(html: &str) -> Option<String> {
 async fn open_page(app: AppHandle, state: tauri::State<'_, AppState>, url: String) -> Result<(), String> {
     if !is_allowed_url(&url) { return Err("请输入有效的 http 或 https 网页地址".to_string()); }
     let settings = state.settings.read().await.clone();
-    debug_log(&format!("[open_page] url={url}, mode={}", settings.listening_mode));
-    if settings.listening_mode == "headless" {
-        open_headless_page(app, &state, &url, &settings).await
-    } else {
-        open_visible_page_inner(app, &state, url).await
-    }
+    debug_log(&format!("[open_page] url={url}"));
+    open_headless_page(app, &state, &url, &settings).await
 }
 
 #[tauri::command]
@@ -758,16 +869,19 @@ async fn get_settings(state: tauri::State<'_, AppState>) -> Result<AppSettings, 
 }
 
 #[tauri::command]
-async fn save_settings(state: tauri::State<'_, AppState>, settings: AppSettings) -> Result<(), String> {
+async fn save_settings(app: AppHandle, state: tauri::State<'_, AppState>, settings: AppSettings) -> Result<(), String> {
     if !matches!(settings.browser_source.as_str(), "managed" | "local") { return Err("无效的 Chromium 来源设置".into()); }
-    if !matches!(settings.listening_mode.as_str(), "headless" | "visible") { return Err("无效的监听模式设置".into()); }
+    let mut settings = settings;
+    settings.max_concurrent = settings.max_concurrent.clamp(1, 16);
+    settings.lan_port = settings.lan_port.clamp(1024, 65535);
     let settings_path = state.settings_path.clone();
     let settings_json = serde_json::to_vec_pretty(&settings).map_err(|error| error.to_string())?;
     if let Some(parent) = settings_path.parent() {
         tokio::fs::create_dir_all(parent).await.map_err(|error| error.to_string())?;
     }
     tokio::fs::write(settings_path, settings_json).await.map_err(|error| error.to_string())?;
-    *state.settings.write().await = settings;
+    *state.settings.write().await = settings.clone();
+    if settings.lan_enabled { start_lan_server(&app, settings.lan_port)?; } else { stop_lan_server(&app); }
     Ok(())
 }
 
@@ -787,29 +901,192 @@ fn get_media(state: tauri::State<'_, AppState>) -> Result<Vec<MediaItem>, String
     Ok(state.media.lock().map_err(|_| "媒体列表锁定失败".to_string())?.values().cloned().collect())
 }
 
+/// 启动一个下载任务的后台协程（取消令牌须已在 downloads 中注册）。resume 为 (已完成单元数, 已完成字节数)。
+fn spawn_with_token(app: &AppHandle, payload: DownloadRequest, output_dir: PathBuf, resume: Option<(u64, u64)>, cancel: Arc<tokio::sync::Mutex<bool>>) {
+    let app_handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let task_id = payload.id.clone();
+        let task_name = payload.filename.clone();
+        if let Err(error) = download_media(app_handle.clone(), payload, output_dir, cancel.clone(), resume).await {
+            // 保留已下载进度，避免失败事件把分片数清零（影响后续断点续传）
+            let state = app_handle.state::<AppState>();
+            let (received, total, unit, received_bytes, total_bytes) = state.tasks.lock().ok()
+                .and_then(|tasks| tasks.get(&task_id).map(|record| (record.received, record.total, record.unit.clone(), record.received_bytes, record.total_bytes)))
+                .unwrap_or((0, None, None, None, None));
+            emit_download(&app_handle, DownloadUpdate { id: task_id.clone(), filename: task_name, status: "failed".into(), received, total, error: Some(error), unit, received_bytes, total_bytes });
+        }
+        if let Ok(mut downloads) = app_handle.state::<AppState>().downloads.lock() { downloads.remove(&task_id); }
+        drain_download_queue(&app_handle).await;
+    });
+}
+
+/// 任务结束后补位：队列中有等待任务且并发未满时依次启动。
+async fn drain_download_queue(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    let max = state.settings.read().await.max_concurrent.max(1) as usize;
+    loop {
+        let (queued, cancel) = {
+            let mut downloads = match state.downloads.lock() { Ok(downloads) => downloads, Err(_) => return };
+            if downloads.len() >= max { return; }
+            let next = match state.download_queue.lock() { Ok(mut queue) => queue.pop_front(), Err(_) => None };
+            let Some(next) = next else { return };
+            let cancel = Arc::new(tokio::sync::Mutex::new(false));
+            downloads.insert(next.payload.id.clone(), cancel.clone());
+            (next, cancel)
+        };
+        let (received, total, unit, received_bytes, total_bytes) = state.tasks.lock().ok()
+            .and_then(|tasks| tasks.get(&queued.payload.id).map(|record| (record.received, record.total, record.unit.clone(), record.received_bytes, record.total_bytes)))
+            .unwrap_or((0, None, None, None, None));
+        emit_download(app, DownloadUpdate { id: queued.payload.id.clone(), filename: queued.payload.filename.clone(), status: "downloading".into(), received, total, error: None, unit, received_bytes, total_bytes });
+        spawn_with_token(app, queued.payload, queued.output_dir, queued.resume, cancel);
+    }
+}
+
+/// 提交下载：并发未满则立即启动，否则进入等待队列（状态置为 queued）。
+async fn enqueue_or_spawn(app: &AppHandle, state: &AppState, payload: DownloadRequest, output_dir: PathBuf, resume: Option<(u64, u64)>) -> Result<(), String> {
+    let max = state.settings.read().await.max_concurrent.max(1) as usize;
+    let cancel = Arc::new(tokio::sync::Mutex::new(false));
+    {
+        let mut downloads = state.downloads.lock().map_err(|_| "下载队列锁定失败".to_string())?;
+        if downloads.contains_key(&payload.id) { return Err("任务正在下载中".to_string()); }
+        if downloads.len() >= max {
+            drop(downloads);
+            state.download_queue.lock().map_err(|_| "下载队列锁定失败".to_string())?
+                .push_back(QueuedDownload { payload: payload.clone(), output_dir, resume });
+            let (received, total, unit, received_bytes, total_bytes) = state.tasks.lock().ok()
+                .and_then(|tasks| tasks.get(&payload.id).map(|record| (record.received, record.total, record.unit.clone(), record.received_bytes, record.total_bytes)))
+                .unwrap_or((0, None, None, None, None));
+            emit_download(app, DownloadUpdate { id: payload.id, filename: payload.filename, status: "queued".into(), received, total, error: None, unit, received_bytes, total_bytes });
+            return Ok(());
+        }
+        downloads.insert(payload.id.clone(), cancel.clone());
+    }
+    spawn_with_token(app, payload, output_dir, resume, cancel);
+    Ok(())
+}
+
 #[tauri::command]
 async fn start_download(app: AppHandle, state: tauri::State<'_, AppState>, payload: DownloadRequest) -> Result<(), String> {
     if !is_allowed_url(&payload.url) { return Err("只支持 http 或 https 媒体地址".to_string()); }
     let settings = state.settings.read().await.clone();
     let output_dir = app_download_dir(&app, &settings)?;
-    let cancel = Arc::new(tokio::sync::Mutex::new(false));
-    state.downloads.lock().map_err(|_| "下载队列锁定失败".to_string())?.insert(payload.id.clone(), cancel.clone());
-    let app_handle = app.clone();
-    let app_for_cleanup = app.clone();
-    tauri::async_runtime::spawn(async move {
-        let task_id = payload.id.clone();
-        let task_name = payload.filename.clone();
-        if let Err(error) = download_media(app_handle.clone(), payload, output_dir, cancel.clone()).await {
-            emit_download(&app_handle, DownloadUpdate { id: task_id.clone(), filename: task_name, status: "failed".into(), received: 0, total: None, error: Some(error), unit: None, received_bytes: None, total_bytes: None });
+    {
+        let mut tasks = state.tasks.lock().map_err(|_| "任务列表锁定失败".to_string())?;
+        tasks.insert(payload.id.clone(), TaskRecord {
+            id: payload.id.clone(), url: payload.url.clone(), filename: payload.filename.clone(),
+            referer: payload.referer.clone(), subdir: None, status: "downloading".into(),
+            received: 0, total: None, unit: None, received_bytes: None, total_bytes: None, error: None,
+            created_at: chrono_time(),
+        });
+        save_tasks_locked(&tasks, &state.tasks_path);
+    }
+    enqueue_or_spawn(&app, state.inner(), payload, output_dir, None).await
+}
+
+/// 重试/继续下载：有进度的任务从断点续传，否则重新下载。
+#[tauri::command]
+async fn retry_download(app: AppHandle, state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
+    let record = state.tasks.lock().map_err(|_| "任务列表锁定失败".to_string())?.get(&id).cloned()
+        .ok_or_else(|| "任务不存在或已被删除".to_string())?;
+    if state.downloads.lock().map_err(|_| "下载队列锁定失败".to_string())?.contains_key(&id) {
+        return Err("任务正在下载中".to_string());
+    }
+    if state.download_queue.lock().map_err(|_| "下载队列锁定失败".to_string())?.iter().any(|item| item.payload.id == id) {
+        return Err("任务已在下载队列中等待".to_string());
+    }
+    let settings = state.settings.read().await.clone();
+    let base_dir = app_download_dir(&app, &settings)?;
+    let output_dir = match &record.subdir {
+        Some(name) => {
+            let dir = base_dir.join(safe_filename(name));
+            std::fs::create_dir_all(&dir).map_err(|error| format!("创建子目录失败: {error}"))?;
+            dir
         }
-        if let Ok(mut downloads) = app_for_cleanup.state::<AppState>().downloads.lock() { downloads.remove(&task_id); }
-    });
+        None => base_dir,
+    };
+    let resume = if record.received > 0 { Some((record.received, record.received_bytes.unwrap_or(0))) } else { None };
+    emit_download(&app, DownloadUpdate { id: record.id.clone(), filename: record.filename.clone(), status: "downloading".into(), received: record.received, total: record.total, error: None, unit: record.unit.clone(), received_bytes: record.received_bytes, total_bytes: record.total_bytes });
+    let payload = DownloadRequest { id: record.id, url: record.url, filename: record.filename, referer: record.referer };
+    enqueue_or_spawn(&app, state.inner(), payload, output_dir, resume).await
+}
+
+/// 删除任务记录；未完成的任务同时清理半成品文件，已完成文件保留。
+#[tauri::command]
+async fn delete_task(app: AppHandle, state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
+    let record = state.tasks.lock().map_err(|_| "任务列表锁定失败".to_string())?.remove(&id);
+    if let Ok(tasks) = state.tasks.lock() { save_tasks_locked(&tasks, &state.tasks_path); }
+    if let Some(record) = record {
+        if record.status != "complete" {
+            let settings = state.settings.read().await.clone();
+            if let Ok(base_dir) = app_download_dir(&app, &settings) {
+                let dir = match &record.subdir { Some(name) => base_dir.join(safe_filename(name)), None => base_dir };
+                let on_disk = if classify_media(&record.url).as_deref() == Some("m3u8") { hls_output_filename(&record.filename) } else { safe_filename(&record.filename) };
+                let path = dir.join(on_disk);
+                if path.exists() { let _ = std::fs::remove_file(path); }
+            }
+        }
+    }
     Ok(())
 }
 
-async fn download_media(app: AppHandle, payload: DownloadRequest, output_dir: PathBuf, cancel: Arc<tokio::sync::Mutex<bool>>) -> Result<(), String> {
-    if classify_media(&payload.url).as_deref() == Some("m3u8") { download_hls(app, payload, output_dir, cancel).await }
-    else { download_direct(app, payload, output_dir, cancel).await }
+#[tauri::command]
+fn get_tasks(state: tauri::State<'_, AppState>) -> Result<Vec<TaskRecord>, String> {
+    let tasks = state.tasks.lock().map_err(|_| "任务列表锁定失败".to_string())?;
+    let mut records: Vec<TaskRecord> = tasks.values().cloned().collect();
+    records.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+    Ok(records)
+}
+
+/// 一键清除已完成任务（只删任务记录，已下载的文件保留）
+#[tauri::command]
+fn clear_completed_tasks(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let mut tasks = state.tasks.lock().map_err(|_| "任务列表锁定失败".to_string())?;
+    tasks.retain(|_, record| record.status != "complete");
+    save_tasks_locked(&tasks, &state.tasks_path);
+    Ok(())
+}
+
+/// 在系统文件管理器中显示任务对应的文件（文件不存在则打开下载目录）
+#[tauri::command]
+async fn show_in_folder(app: AppHandle, state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
+    let record = state.tasks.lock().map_err(|_| "任务列表锁定失败".to_string())?.get(&id).cloned()
+        .ok_or_else(|| "任务不存在或已被删除".to_string())?;
+    let settings = state.settings.read().await.clone();
+    let base_dir = app_download_dir(&app, &settings)?;
+    let dir = match &record.subdir { Some(name) => base_dir.join(safe_filename(name)), None => base_dir.clone() };
+    let on_disk = if classify_media(&record.url).as_deref() == Some("m3u8") { hls_output_filename(&record.filename) } else { safe_filename(&record.filename) };
+    reveal_in_folder(dir.join(on_disk), dir)
+}
+
+fn reveal_in_folder(path: PathBuf, dir: PathBuf) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let result = if path.exists() {
+            std::process::Command::new("open").arg("-R").arg(&path).status()
+        } else {
+            std::process::Command::new("open").arg(&dir).status()
+        };
+        return result.map_err(|error| error.to_string()).map(|_| ());
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let result = if path.exists() {
+            std::process::Command::new("explorer").arg(format!("/select,{}", path.display())).status()
+        } else {
+            std::process::Command::new("explorer").arg(&dir).status()
+        };
+        return result.map_err(|error| error.to_string()).map(|_| ());
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let _ = path;
+        return std::process::Command::new("xdg-open").arg(&dir).status().map_err(|error| error.to_string()).map(|_| ());
+    }
+}
+
+async fn download_media(app: AppHandle, payload: DownloadRequest, output_dir: PathBuf, cancel: Arc<tokio::sync::Mutex<bool>>, resume: Option<(u64, u64)>) -> Result<(), String> {
+    if classify_media(&payload.url).as_deref() == Some("m3u8") { download_hls(app, payload, output_dir, cancel, resume).await }
+    else { download_direct(app, payload, output_dir, cancel, resume).await }
 }
 
 fn build_client(referer: Option<&str>) -> Result<Client, String> {
@@ -825,17 +1102,36 @@ fn build_client(referer: Option<&str>) -> Result<Client, String> {
         .map_err(|error| error.to_string())
 }
 
-async fn download_direct(app: AppHandle, payload: DownloadRequest, output_dir: PathBuf, cancel: Arc<tokio::sync::Mutex<bool>>) -> Result<(), String> {
+async fn download_direct(app: AppHandle, payload: DownloadRequest, output_dir: PathBuf, cancel: Arc<tokio::sync::Mutex<bool>>, resume: Option<(u64, u64)>) -> Result<(), String> {
     let client = build_client(payload.referer.as_deref())?;
-    let response = client.get(&payload.url).send().await.map_err(|error| error.to_string())?;
-    if !response.status().is_success() { return Err(format!("下载请求返回 {}", response.status())); }
-    let total = response.content_length();
     let path = output_dir.join(safe_filename(&payload.filename));
-    let mut file = File::create(&path).await.map_err(|error| error.to_string())?;
+    // 断点续传：已有半成品文件时从文件大小处继续
+    let mut start_at = 0u64;
+    if resume.is_some() {
+        if let Ok(meta) = tokio::fs::metadata(&path).await {
+            if meta.len() > 0 { start_at = meta.len(); debug_log(&format!("[download_direct] resuming at {start_at} bytes")); }
+        }
+    }
+    let mut request = client.get(&payload.url);
+    if start_at > 0 { request = request.header(header::RANGE, format!("bytes={start_at}-")); }
+    let response = request.send().await.map_err(|error| error.to_string())?;
+    let status = response.status();
+    if !status.is_success() && status.as_u16() != 206 { return Err(format!("下载请求返回 {status}")); }
+    // 服务器支持 Range 会返回 206，追加写入；忽略 Range（200）则从头下载
+    let (mut file, mut received) = if start_at > 0 && status.as_u16() == 206 {
+        (OpenOptions::new().append(true).open(&path).await.map_err(|error| error.to_string())?, start_at)
+    } else {
+        (File::create(&path).await.map_err(|error| error.to_string())?, 0u64)
+    };
+    let total = response.content_length().map(|remaining| remaining + received);
     let mut stream = response.bytes_stream();
-    let mut received = 0;
     while let Some(chunk) = stream.next().await {
-        if *cancel.lock().await { let _ = tokio::fs::remove_file(&path).await; return Err("下载已取消".to_string()); }
+        if *cancel.lock().await {
+            // 保留半成品文件以便续传
+            file.flush().await.ok();
+            emit_download(&app, DownloadUpdate { id: payload.id.clone(), filename: payload.filename.clone(), status: "canceled".into(), received, total, error: None, unit: Some("bytes".into()), received_bytes: None, total_bytes: None });
+            return Ok(());
+        }
         let chunk = chunk.map_err(|error| error.to_string())?;
         file.write_all(&chunk).await.map_err(|error| error.to_string())?;
         received += chunk.len() as u64;
@@ -846,7 +1142,16 @@ async fn download_direct(app: AppHandle, payload: DownloadRequest, output_dir: P
     Ok(())
 }
 
-async fn download_hls(app: AppHandle, payload: DownloadRequest, output_dir: PathBuf, cancel: Arc<tokio::sync::Mutex<bool>>) -> Result<(), String> {
+/// Merged segment stream is an MPEG-TS video, not a playlist — use .ts extension.
+fn hls_output_filename(filename: &str) -> String {
+    let safe_name = safe_filename(filename);
+    safe_name
+        .strip_suffix(".m3u8").or_else(|| safe_name.strip_suffix(".mpd"))
+        .map(|stem| format!("{stem}.ts"))
+        .unwrap_or(if safe_name.contains('.') { safe_name } else { format!("{safe_name}.ts") })
+}
+
+async fn download_hls(app: AppHandle, payload: DownloadRequest, output_dir: PathBuf, cancel: Arc<tokio::sync::Mutex<bool>>, resume: Option<(u64, u64)>) -> Result<(), String> {
     let client = build_client(payload.referer.as_deref())?;
     let mut playlist_url = Url::parse(&payload.url).map_err(|error| error.to_string())?;
     let mut playlist = client.get(playlist_url.clone()).send().await.map_err(|error| error.to_string())?.error_for_status().map_err(|error| error.to_string())?.text().await.map_err(|error| error.to_string())?;
@@ -874,6 +1179,8 @@ async fn download_hls(app: AppHandle, payload: DownloadRequest, output_dir: Path
     let mut segments = Vec::new();
     let mut current_key: Option<HlsKey> = None;
     for line in playlist.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        // ENDLIST 之后的行均为服务器写入的脏数据（曾出现残片 URL 被误认为分片导致 404），直接停止解析
+        if line.starts_with("#EXT-X-ENDLIST") { break; }
         if let Some(attrs) = line.strip_prefix("#EXT-X-KEY:") {
             let method = attribute(attrs, "METHOD").unwrap_or_default();
             if method != "NONE" {
@@ -886,19 +1193,48 @@ async fn download_hls(app: AppHandle, payload: DownloadRequest, output_dir: Path
     }
     if segments.is_empty() { return Err("播放列表中没有媒体分片".to_string()); }
     if segments.len() > 10_000 { return Err("分片数量超过 10000，已停止以避免占用过多资源".to_string()); }
-    // Merged segment stream is an MPEG-TS video, not a playlist — use .ts extension.
-    let safe_name = safe_filename(&payload.filename);
-    let filename = safe_name
-        .strip_suffix(".m3u8").or_else(|| safe_name.strip_suffix(".mpd"))
-        .map(|stem| format!("{stem}.ts"))
-        .unwrap_or(if safe_name.contains('.') { safe_name } else { format!("{safe_name}.ts") });
+    let filename = hls_output_filename(&payload.filename);
     let path = output_dir.join(filename.clone());
-    let mut output = File::create(&path).await.map_err(|error| error.to_string())?;
     let total = segments.len() as u64;
+    // 断点续传：截断到已确认的完整分片边界（防止上次中断残留半个分片），跳过已下载分片
+    let mut skip = 0usize;
     let mut received = 0u64;
     let mut received_bytes = 0u64;
-    for (index, (segment_url, key)) in segments.iter().enumerate() {
-        if *cancel.lock().await { let _ = tokio::fs::remove_file(&path).await; return Err("下载已取消".to_string()); }
+    let mut output = match resume {
+        Some((done_segments, done_bytes)) if done_segments > 0 => {
+            match OpenOptions::new().read(true).write(true).open(&path).await {
+                Ok(_) if done_segments >= total => {
+                    emit_download(&app, DownloadUpdate { id: payload.id.clone(), filename: filename.clone(), status: "complete".into(), received: total, total: Some(total), error: None, unit: Some("segments".into()), received_bytes: Some(done_bytes), total_bytes: Some(done_bytes) });
+                    return Ok(());
+                }
+                Ok(file) => {
+                    let len = file.metadata().await.map_err(|error| error.to_string())?.len();
+                    let keep = done_bytes.min(len);
+                    if keep > 0 {
+                        file.set_len(keep).await.map_err(|error| error.to_string())?;
+                        drop(file);
+                        debug_log(&format!("[download_hls] resuming: skip {done_segments}/{total} segments, keep {keep} bytes"));
+                        skip = done_segments as usize;
+                        received = done_segments;
+                        received_bytes = keep;
+                        OpenOptions::new().append(true).open(&path).await.map_err(|error| error.to_string())?
+                    } else {
+                        drop(file);
+                        File::create(&path).await.map_err(|error| error.to_string())?
+                    }
+                }
+                Err(_) => File::create(&path).await.map_err(|error| error.to_string())?,
+            }
+        }
+        _ => File::create(&path).await.map_err(|error| error.to_string())?,
+    };
+    for (index, (segment_url, key)) in segments.iter().enumerate().skip(skip) {
+        if *cancel.lock().await {
+            // 保留半成品文件以便续传
+            output.flush().await.ok();
+            emit_download(&app, DownloadUpdate { id: payload.id.clone(), filename: payload.filename.clone(), status: "canceled".into(), received, total: Some(total), error: None, unit: Some("segments".into()), received_bytes: Some(received_bytes), total_bytes: None });
+            return Ok(());
+        }
         // Retry each segment up to 3 times so a transient network error doesn't abort the whole download.
         let mut segment_bytes = None;
         let mut last_error = String::new();
@@ -917,8 +1253,10 @@ async fn download_hls(app: AppHandle, payload: DownloadRequest, output_dir: Path
             }
         }
         let Some(mut bytes) = segment_bytes else {
-            let _ = tokio::fs::remove_file(&path).await;
-            return Err(format!("分片 {}/{} 下载失败: {last_error}", index + 1, total));
+            output.flush().await.ok();
+            let message = format!("分片 {}/{} 下载失败: {last_error}", index + 1, total);
+            emit_download(&app, DownloadUpdate { id: payload.id.clone(), filename: payload.filename.clone(), status: "failed".into(), received, total: Some(total), error: Some(message.clone()), unit: Some("segments".into()), received_bytes: Some(received_bytes), total_bytes: None });
+            return Err(message);
         };
         if let Some(key) = key { decrypt_aes128(&client, key, media_sequence + index as u64, &mut bytes).await?; }
         output.write_all(&bytes).await.map_err(|error| error.to_string())?;
@@ -962,10 +1300,21 @@ async fn decrypt_aes128(client: &Client, key: &HlsKey, sequence: u64, bytes: &mu
 }
 
 #[tauri::command]
-fn cancel_download(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
+fn cancel_download(app: AppHandle, state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
     if let Some(cancel) = state.downloads.lock().map_err(|_| "下载队列锁定失败".to_string())?.get(&id) {
         let cancel = cancel.clone();
         tauri::async_runtime::spawn(async move { *cancel.lock().await = true; });
+        return Ok(());
+    }
+    // 排队中的任务直接从队列移除，无需经过下载循环
+    let mut queue = state.download_queue.lock().map_err(|_| "下载队列锁定失败".to_string())?;
+    if let Some(position) = queue.iter().position(|item| item.payload.id == id) {
+        queue.remove(position);
+        drop(queue);
+        let (filename, received, total, unit, received_bytes, total_bytes) = state.tasks.lock().ok()
+            .and_then(|tasks| tasks.get(&id).map(|record| (record.filename.clone(), record.received, record.total, record.unit.clone(), record.received_bytes, record.total_bytes)))
+            .ok_or_else(|| "任务不存在或已被删除".to_string())?;
+        emit_download(&app, DownloadUpdate { id, filename, status: "canceled".into(), received, total, error: None, unit, received_bytes, total_bytes });
     }
     Ok(())
 }
@@ -992,6 +1341,8 @@ struct BatchProgress {
 struct Episode {
     title: String,
     url: String,
+    #[serde(default)]
+    show: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -1004,15 +1355,16 @@ struct AnalyzeResult {
 const EPISODE_SYSTEM_PROMPT: &str = r#"你是视频站点分析助手。用户会给你一个网页的信息（URL、标题、链接列表，格式 text|href）。你的任务是找出所有"剧集播放页"的链接。
 
 只输出一个 JSON 对象，不要输出任何其他文字：
-- 如果链接列表已包含剧集播放页：{"action":"done","episodes":[{"title":"第1集","url":"绝对URL"},...]}
+- 如果链接列表已包含剧集播放页：{"action":"done","show":"作品名称","episodes":[{"title":"第1集","url":"绝对URL"},...]}
 - 如果需要先打开某个页面才能看到剧集列表（例如当前页是详情页、首页或需要进入播放列表页）：{"action":"open","url":"要打开的页面URL","reason":"原因"}
 - 如果确实找不到剧集链接：{"action":"fail","reason":"原因"}
 
 规则：
 1. episodes 里的 url 必须来自提供的链接列表（把相对路径转为绝对路径），不要编造 URL
 2. title 优先用链接文本（如"第1集"），没有则用 URL 最后一段
-3. 按集数/顺序排列，尽量覆盖全部集数
-4. 只输出 JSON"#;
+3. show 是作品本身的名称（如"光阴之外"），从页面标题或链接文本中提取；不包含"第X集"、季数、线路、清晰度、站点名等信息
+4. 按集数/顺序排列，尽量覆盖全部集数
+5. 只输出 JSON"#;
 
 /// Truncate long strings for log readability while keeping enough context to debug.
 fn truncate_for_log(text: &str, max_len: usize) -> String {
@@ -1042,7 +1394,8 @@ async fn llm_chat(settings: &AppSettings, system: &str, user: &str) -> Result<St
         .build().map_err(|error| error.to_string())?;
     let body = serde_json::json!({
         "model": settings.llm_model,
-        "temperature": 0.2,
+        // Kimi 兼容模式只接受 0.0/0.6/1.0，0.0 对各家 OpenAI 兼容接口都安全
+        "temperature": 0.0,
         "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
@@ -1182,15 +1535,16 @@ async fn analyze_episodes(app: AppHandle, state: tauri::State<'_, AppState>, url
         debug_log(&format!("[analyze_episodes] round {round} action={:?}", json["action"].as_str()));
         match json["action"].as_str().unwrap_or_default() {
             "done" => {
+                let show = json["show"].as_str().map(|value| value.trim().to_string()).filter(|value| !value.is_empty());
                 let episodes = json["episodes"].as_array().cloned().unwrap_or_default().iter().filter_map(|item| {
                     let url = item["url"].as_str()?.to_string();
                     if !is_allowed_url(&url) { return None; }
                     let title = item["title"].as_str().map(|value| value.to_string())
                         .unwrap_or_else(|| url.rsplit('/').next().unwrap_or("剧集").to_string());
-                    Some(Episode { title, url })
+                    Some(Episode { title, url, show: show.clone() })
                 }).collect::<Vec<_>>();
                 if episodes.is_empty() { debug_log(&format!("[analyze_episodes] round {round} action=done but 0 valid episodes")); return Err(format!("第 {round} 轮：AI 判定完成但没有找到任何有效的剧集链接")); }
-                debug_log(&format!("[analyze_episodes] done: {} episodes found", episodes.len()));
+                debug_log(&format!("[analyze_episodes] done: {} episodes found, show={show:?}", episodes.len()));
                 steps.push(format!("分析完成：找到 {} 集", episodes.len()));
                 let _ = app.emit("batch-progress", BatchProgress { stage: "analyzing".into(), message: format!("找到 {} 集", episodes.len()), current: None, total: None });
                 return Ok(AnalyzeResult { episodes, steps });
@@ -1283,11 +1637,20 @@ async fn capture_episode_media(browser: &Arc<Browser>, page_url: &str) -> Result
 
 /// Probe every episode page, capture its media URL, and queue downloads.
 #[tauri::command]
-async fn batch_download(app: AppHandle, state: tauri::State<'_, AppState>, episodes: Vec<Episode>) -> Result<(), String> {
-    debug_log(&format!("[batch_download] starting with {} episodes", episodes.len()));
+async fn batch_download(app: AppHandle, state: tauri::State<'_, AppState>, episodes: Vec<Episode>, subdir: Option<String>) -> Result<(), String> {
+    debug_log(&format!("[batch_download] starting with {} episodes, subdir={subdir:?}", episodes.len()));
     if episodes.is_empty() { return Err("剧集列表为空".to_string()); }
+    let subdir = subdir.map(|name| name.trim().to_string()).filter(|name| !name.is_empty());
     let settings = state.settings.read().await.clone();
-    let output_dir = app_download_dir(&app, &settings)?;
+    let base_dir = app_download_dir(&app, &settings)?;
+    let output_dir = match &subdir {
+        Some(name) => {
+            let dir = base_dir.join(safe_filename(name));
+            std::fs::create_dir_all(&dir).map_err(|error| format!("创建子目录失败: {error}"))?;
+            dir
+        }
+        None => base_dir,
+    };
     ensure_headless_browser(&app, &state, &settings).await?;
     let browser = state.headless_browser.lock().await.clone().ok_or("Chromium 初始化失败")?;
 
@@ -1311,23 +1674,29 @@ async fn batch_download(app: AppHandle, state: tauri::State<'_, AppState>, episo
                 let redirect_note = redirected_to.as_deref().map(|u| format!("（页面跳转至 {u}）")).unwrap_or_default();
                 debug_log(&format!("[batch] episode '{}' -> {media_url}{redirect_note}", episode.title));
                 let _ = emit_captured(&app, &state, media_url.clone(), effective_page_url.clone(), None, None);
+                let base_name = match &episode.show {
+                    Some(show) if !episode.title.contains(show.as_str()) => format!("{} {}", show, episode.title),
+                    _ => episode.title.clone(),
+                };
                 let payload = DownloadRequest {
                     id: format!("batch-{}-{}", chrono_time(), index),
                     url: media_url,
-                    filename: format!("{}.ts", episode.title),
+                    filename: format!("{base_name}.ts"),
                     referer: Some(effective_page_url),
                 };
-                let cancel = Arc::new(tokio::sync::Mutex::new(false));
-                state.downloads.lock().map_err(|_| "下载队列锁定失败".to_string())?.insert(payload.id.clone(), cancel.clone());
-                let app_handle = app.clone();
-                let task_id = payload.id.clone();
-                let task_dir = output_dir.clone();
-                let task_name = episode.title.clone();
-                tauri::async_runtime::spawn(async move {
-                    if let Err(error) = download_media(app_handle.clone(), payload, task_dir, cancel).await {
-                        let _ = app_handle.emit("download-progress", DownloadUpdate { id: task_id, filename: task_name, status: "failed".into(), received: 0, total: None, error: Some(error), unit: None, received_bytes: None, total_bytes: None });
-                    }
-                });
+                {
+                    let mut tasks = state.tasks.lock().map_err(|_| "任务列表锁定失败".to_string())?;
+                    tasks.insert(payload.id.clone(), TaskRecord {
+                        id: payload.id.clone(), url: payload.url.clone(), filename: payload.filename.clone(),
+                        referer: payload.referer.clone(), subdir: subdir.clone(), status: "downloading".into(),
+                        received: 0, total: None, unit: None, received_bytes: None, total_bytes: None, error: None,
+                        created_at: chrono_time(),
+                    });
+                    save_tasks_locked(&tasks, &state.tasks_path);
+                }
+                if let Err(error) = enqueue_or_spawn(&app, &state, payload, output_dir.clone(), None).await {
+                    debug_log(&format!("[batch] spawn download failed for '{}': {error}", episode.title));
+                }
             }
             Ok((None, _)) => {
                 let message = format!("「{}」未探测到播放地址（可能是页面未播放或未使用 m3u8/mpd 格式）", episode.title);
@@ -1346,10 +1715,11 @@ async fn batch_download(app: AppHandle, state: tauri::State<'_, AppState>, episo
 }
 
 #[tauri::command]
-async fn analyze_page_links(app: AppHandle, state: tauri::State<'_, AppState>, url: String, html_or_links: String) -> Result<AnalyzeResult, String> {
+async fn analyze_page_links(app: AppHandle, state: tauri::State<'_, AppState>, url: String, html_or_links: String, title: Option<String>) -> Result<AnalyzeResult, String> {
     let settings = state.settings.read().await.clone();
     let lines = html_or_links.lines().count();
-    let user_message = format!("页面 URL: {url}\n\n链接列表（格式 文本|URL）：\n{html_or_links}");
+    let page_title = title.unwrap_or_default();
+    let user_message = format!("页面 URL: {url}\n页面标题: {page_title}\n\n链接列表（格式 文本|URL）：\n{html_or_links}");
     let _ = app.emit("batch-progress", BatchProgress { stage: "analyzing".into(), message: format!("LLM 正在分析 {lines} 个链接…"), current: Some(1), total: Some(1) });
     let reply = llm_chat(&settings, EPISODE_SYSTEM_PROMPT, &user_message).await
         .map_err(|error| format!("AI 分析失败：{error}"))?;
@@ -1358,12 +1728,13 @@ async fn analyze_page_links(app: AppHandle, state: tauri::State<'_, AppState>, u
     };
     match json["action"].as_str().unwrap_or_default() {
         "done" => {
+            let show = json["show"].as_str().map(|value| value.trim().to_string()).filter(|value| !value.is_empty());
             let episodes = json["episodes"].as_array().cloned().unwrap_or_default().iter().filter_map(|item| {
                 let url = item["url"].as_str()?.to_string();
                 if !is_allowed_url(&url) { return None; }
                 let title = item["title"].as_str().map(|value| value.to_string())
                     .unwrap_or_else(|| url.rsplit('/').next().unwrap_or("剧集").to_string());
-                Some(Episode { title, url })
+                Some(Episode { title, url, show: show.clone() })
             }).collect::<Vec<_>>();
             if episodes.is_empty() { return Err("AI 判定完成但没有找到任何有效的剧集链接".to_string()); }
             let steps = vec![format!("从页面提取到 {} 个链接，AI 成功解析出 {} 集", lines, episodes.len())];
@@ -1376,6 +1747,493 @@ async fn analyze_page_links(app: AppHandle, state: tauri::State<'_, AppState>, u
         }
     }
 }
+
+// ===== 局域网下载服务 =====
+
+fn start_lan_server(app: &AppHandle, port: u32) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    if let Ok(guard) = state.lan_server.lock() {
+        if let Some(running) = guard.as_ref() {
+            if running.port == port { return Ok(()); }
+        }
+    }
+    stop_lan_server(app);
+    let server = tiny_http::Server::http(("0.0.0.0", port as u16)).map_err(|error| format!("端口 {port} 启动失败: {error}"))?;
+    let lan = Arc::new(LanServer { port, server: Arc::new(server) });
+    *state.lan_server.lock().map_err(|_| "服务状态锁定失败".to_string())? = Some(lan.clone());
+    let app_handle = app.clone();
+    std::thread::spawn(move || {
+        for request in lan.server.incoming_requests() {
+            let app = app_handle.clone();
+            std::thread::spawn(move || handle_lan_request(&app, request));
+        }
+        debug_log("[lan] server loop exited");
+    });
+    debug_log(&format!("[lan] server started on port {port}"));
+    Ok(())
+}
+
+fn stop_lan_server(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    if let Ok(mut guard) = state.lan_server.lock() {
+        if let Some(lan) = guard.take() {
+            lan.server.unblock();
+            debug_log("[lan] server stopped");
+        }
+    };
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LanInfo {
+    running: bool,
+    port: u32,
+    urls: Vec<String>,
+}
+
+#[tauri::command]
+fn get_lan_info(state: tauri::State<'_, AppState>) -> Result<LanInfo, String> {
+    let running = state.lan_server.lock().map_err(|_| "服务状态锁定失败".to_string())?;
+    let (running, port) = match running.as_ref() { Some(lan) => (true, lan.port), None => (false, 0) };
+    let urls = if running { local_lan_urls(port) } else { vec![] };
+    Ok(LanInfo { running, port, urls })
+}
+
+fn local_lan_urls(port: u32) -> Vec<String> {
+    // UDP connect 不发送数据，只为让系统选出到公网路由对应的本机局域网 IP
+    let mut urls = Vec::new();
+    if let Ok(socket) = std::net::UdpSocket::bind(("0.0.0.0", 0)) {
+        if socket.connect(("8.8.8.8", 80)).is_ok() {
+            if let Ok(addr) = socket.local_addr() {
+                urls.push(format!("http://{}:{port}", addr.ip()));
+            }
+        }
+    }
+    urls
+}
+
+type LanResponse = tiny_http::Response<Box<dyn std::io::Read + Send>>;
+
+fn handle_lan_request(app: &AppHandle, mut request: tiny_http::Request) {
+    let method = request.method().as_str().to_string();
+    let raw_url = request.url().to_string();
+    let mut url_parts = raw_url.splitn(2, '?');
+    let path = url_parts.next().unwrap_or("/").to_string();
+    let query = url_parts.next().unwrap_or("").to_string();
+    let response: LanResponse = match (method.as_str(), path.as_str()) {
+        ("GET", "/") => text_response(LAN_PAGE.to_string(), "text/html; charset=utf-8"),
+        ("GET", "/api/tasks") => json_response(lan_tasks_json(app)),
+        ("GET", "/api/dirs") => json_response(lan_dirs_json(app)),
+        ("GET", "/api/files") => json_response(lan_files_json(app)),
+        ("GET", "/files") => {
+            let rel = query.split('&').find_map(|pair| pair.strip_prefix("path=")).unwrap_or("");
+            lan_serve_file(app, &urlencoding_decode(rel))
+        }
+        ("POST", "/api/download") => {
+            let mut body = String::new();
+            match std::io::Read::read_to_string(&mut request.as_reader(), &mut body) {
+                Ok(_) => json_response(tauri::async_runtime::block_on(lan_submit(app, &body))),
+                Err(_) => json_status("{\"error\":\"读取请求失败\"}".to_string(), 400),
+            }
+        }
+        _ => json_status("{\"error\":\"not found\"}".to_string(), 404),
+    };
+    let _ = request.respond(response);
+}
+
+fn text_response(body: String, content_type: &str) -> LanResponse {
+    let bytes = body.into_bytes();
+    let header = tiny_http::Header::from_bytes("Content-Type".as_bytes(), content_type.as_bytes()).unwrap();
+    tiny_http::Response::new(tiny_http::StatusCode(200), vec![header], Box::new(std::io::Cursor::new(bytes.clone())), Some(bytes.len()), None)
+}
+
+fn json_response(json: String) -> LanResponse {
+    text_response(json, "application/json; charset=utf-8")
+}
+
+fn json_status(json: String, code: u16) -> LanResponse {
+    let bytes = json.into_bytes();
+    let header = tiny_http::Header::from_bytes("Content-Type".as_bytes(), &b"application/json; charset=utf-8"[..]).unwrap();
+    tiny_http::Response::new(tiny_http::StatusCode(code), vec![header], Box::new(std::io::Cursor::new(bytes.clone())), Some(bytes.len()), None)
+}
+
+/// 把相对路径解析为下载目录内的真实文件，拒绝路径穿越。
+fn resolve_lan_file(app: &AppHandle, rel: &str) -> Result<(PathBuf, String), String> {
+    let rel = rel.trim().trim_matches('/');
+    if rel.is_empty() || rel.contains("..") || rel.contains('\\') { return Err("非法路径".to_string()); }
+    let state = app.state::<AppState>();
+    let settings = tauri::async_runtime::block_on(state.settings.read()).clone();
+    let base = app_download_dir(app, &settings)?;
+    let base_canonical = base.canonicalize().map_err(|error| error.to_string())?;
+    let full = base.join(rel).canonicalize().map_err(|_| "文件不存在".to_string())?;
+    if !full.starts_with(&base_canonical) || !full.is_file() { return Err("非法路径".to_string()); }
+    let name = full.file_name().map(|name| name.to_string_lossy().to_string()).unwrap_or_else(|| "download".to_string());
+    Ok((full, name))
+}
+
+/// Content-Disposition filename* 的 UTF-8 百分号编码
+fn pct_encode(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    for byte in input.as_bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_') { output.push(*byte as char); }
+        else { output.push_str(&format!("%{byte:02X}")); }
+    }
+    output
+}
+
+fn file_response(file: std::fs::File, size: usize, download_name: &str) -> LanResponse {
+    let disposition = format!("attachment; filename=\"download\"; filename*=UTF-8''{}", pct_encode(download_name));
+    let headers = vec![
+        tiny_http::Header::from_bytes("Content-Type".as_bytes(), &b"application/octet-stream"[..]).unwrap(),
+        tiny_http::Header::from_bytes("Content-Disposition".as_bytes(), disposition.as_bytes()).unwrap(),
+    ];
+    tiny_http::Response::new(tiny_http::StatusCode(200), headers, Box::new(file), Some(size), None)
+}
+
+fn lan_serve_file(app: &AppHandle, rel: &str) -> LanResponse {
+    match resolve_lan_file(app, rel) {
+        Ok((full, name)) => match std::fs::File::open(&full) {
+            Ok(file) => {
+                let size = full.metadata().map(|meta| meta.len() as usize).unwrap_or(0);
+                file_response(file, size, &name)
+            }
+            Err(_) => json_status("{\"error\":\"文件读取失败\"}".to_string(), 500),
+        },
+        Err(error) => json_status(serde_json::json!({"error": error}).to_string(), 400),
+    }
+}
+
+/// 列出下载目录内容：根目录一组 + 每个子目录一组，文件按修改时间倒序。
+fn lan_files_json(app: &AppHandle) -> String {
+    let state = app.state::<AppState>();
+    let settings = tauri::async_runtime::block_on(state.settings.read()).clone();
+    let base = match app_download_dir(app, &settings) { Ok(dir) => dir, Err(_) => return "{\"groups\":[]}".to_string() };
+    let collect_files = |dir: &PathBuf| -> Vec<serde_json::Value> {
+        let mut files: Vec<serde_json::Value> = std::fs::read_dir(dir).map(|entries| entries.flatten().filter_map(|entry| {
+            let meta = entry.metadata().ok()?;
+            if !meta.is_file() { return None; }
+            let name = entry.file_name().into_string().ok()?;
+            if name.starts_with('.') { return None; }
+            let modified = meta.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+            Some(serde_json::json!({"name": name, "size": meta.len(), "modified": modified}))
+        }).collect()).unwrap_or_default();
+        files.sort_by(|a, b| b["modified"].as_u64().cmp(&a["modified"].as_u64()));
+        files
+    };
+    let mut groups = vec![serde_json::json!({"dir": "", "files": collect_files(&base)})];
+    let mut subdirs: Vec<String> = std::fs::read_dir(&base).map(|entries| entries.flatten()
+        .filter(|entry| entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false))
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| !name.starts_with('.'))
+        .collect()).unwrap_or_default();
+    subdirs.sort();
+    for dir in subdirs {
+        groups.push(serde_json::json!({"dir": dir, "files": collect_files(&base.join(&dir))}));
+    }
+    serde_json::json!({"groups": groups}).to_string()
+}
+
+fn lan_tasks_json(app: &AppHandle) -> String {
+    let state = app.state::<AppState>();
+    let mut records: Vec<TaskRecord> = state.tasks.lock().map(|tasks| tasks.values().cloned().collect()).unwrap_or_default();
+    records.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+    serde_json::to_string(&records).unwrap_or_else(|_| "[]".to_string())
+}
+
+fn lan_dirs_json(app: &AppHandle) -> String {
+    let state = app.state::<AppState>();
+    let settings = tauri::async_runtime::block_on(state.settings.read()).clone();
+    let dirs = app_download_dir(app, &settings).map(|base| {
+        std::fs::read_dir(base).map(|entries| entries.flatten()
+            .filter(|entry| entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false))
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .collect::<Vec<_>>()).unwrap_or_default()
+    }).unwrap_or_default();
+    serde_json::to_string(&dirs).unwrap_or_else(|_| "[]".to_string())
+}
+
+#[derive(Deserialize)]
+struct LanSubmitRequest {
+    urls: Vec<String>,
+    #[serde(default)]
+    subdir: Option<String>,
+}
+
+/// LAN 提交：直链直接入队；播放页地址先用无头浏览器探测媒体地址再入队。
+async fn lan_submit(app: &AppHandle, body: &str) -> String {
+    let request: LanSubmitRequest = match serde_json::from_str(body) {
+        Ok(request) => request,
+        Err(_) => return "{\"error\":\"请求格式错误\"}".to_string(),
+    };
+    let urls: Vec<String> = request.urls.iter().map(|url| url.trim().to_string()).filter(|url| !url.is_empty()).take(50).collect();
+    if urls.is_empty() { return "{\"error\":\"请先填写至少一个地址\"}".to_string(); }
+    let subdir = request.subdir.map(|name| name.trim().to_string()).filter(|name| !name.is_empty());
+    let state = app.state::<AppState>();
+    let settings = state.settings.read().await.clone();
+    let base_dir = match app_download_dir(app, &settings) { Ok(dir) => dir, Err(error) => return serde_json::json!({"error": error}).to_string() };
+    let output_dir = match &subdir {
+        Some(name) => {
+            let dir = base_dir.join(safe_filename(name));
+            if let Err(error) = std::fs::create_dir_all(&dir) { return serde_json::json!({"error": format!("创建子目录失败: {error}")}).to_string(); }
+            dir
+        }
+        None => base_dir,
+    };
+    let mut accepted = 0u32;
+    let mut failed: Vec<serde_json::Value> = Vec::new();
+    let mut browser: Option<Arc<Browser>> = None;
+    for (index, raw) in urls.iter().enumerate() {
+        if !is_allowed_url(raw) { failed.push(serde_json::json!({"url": raw, "reason": "仅支持 http/https 地址"})); continue; }
+        let (media_url, referer) = if classify_media(raw).is_some() {
+            (raw.clone(), None)
+        } else {
+            if browser.is_none() {
+                match ensure_headless_browser(app, state.inner(), &settings).await {
+                    Ok(()) => browser = state.headless_browser.lock().await.clone(),
+                    Err(error) => { failed.push(serde_json::json!({"url": raw, "reason": format!("浏览器初始化失败: {error}")})); continue; }
+                }
+            }
+            let Some(instance) = browser.clone() else { failed.push(serde_json::json!({"url": raw, "reason": "浏览器不可用"})); continue; };
+            match capture_episode_media(&instance, raw).await {
+                Ok((Some(media), redirected)) => (media, Some(redirected.unwrap_or_else(|| raw.clone()))),
+                Ok((None, _)) => { failed.push(serde_json::json!({"url": raw, "reason": "未探测到媒体地址"})); continue; }
+                Err(error) => { failed.push(serde_json::json!({"url": raw, "reason": error})); continue; }
+            }
+        };
+        let payload = DownloadRequest {
+            id: format!("lan-{}-{}", chrono_time(), index),
+            url: media_url.clone(),
+            filename: lan_filename(&media_url),
+            referer,
+        };
+        {
+            let mut tasks = match state.tasks.lock() { Ok(tasks) => tasks, Err(_) => return "{\"error\":\"任务列表锁定失败\"}".to_string() };
+            tasks.insert(payload.id.clone(), TaskRecord {
+                id: payload.id.clone(), url: payload.url.clone(), filename: payload.filename.clone(),
+                referer: payload.referer.clone(), subdir: subdir.clone(), status: "downloading".into(),
+                received: 0, total: None, unit: None, received_bytes: None, total_bytes: None, error: None,
+                created_at: chrono_time(),
+            });
+            save_tasks_locked(&tasks, &state.tasks_path);
+        }
+        match enqueue_or_spawn(app, state.inner(), payload, output_dir.clone(), None).await {
+            Ok(()) => accepted += 1,
+            Err(error) => { failed.push(serde_json::json!({"url": raw, "reason": error})); }
+        }
+    }
+    debug_log(&format!("[lan] submit: {accepted} accepted, {} failed", failed.len()));
+    serde_json::json!({"accepted": accepted, "failed": failed}).to_string()
+}
+
+/// 从媒体 URL 推导文件名：末段无意义（index/playlist 等）时用上一级目录名。
+fn lan_filename(media_url: &str) -> String {
+    const GENERIC: [&str; 7] = ["index", "playlist", "main", "master", "chunklist", "media", "video"];
+    let parsed = Url::parse(media_url);
+    let segments: Vec<String> = parsed.as_ref().map(|url| url.path_segments().map(|parts| parts.filter(|part| !part.is_empty()).map(|part| part.to_string()).collect()).unwrap_or_default()).unwrap_or_default();
+    let ext = classify_media(media_url).map(|kind| if kind == "m3u8" { "ts".to_string() } else { kind }).unwrap_or_else(|| "mp4".to_string());
+    let stem = segments.last().map(|segment| {
+        let decoded = urlencoding_decode(segment);
+        decoded.rsplit_once('.').map(|(stem, _)| stem.to_string()).unwrap_or(decoded)
+    }).filter(|stem| !stem.is_empty() && !GENERIC.contains(&stem.to_ascii_lowercase().as_str()))
+        .or_else(|| segments.get(segments.len().saturating_sub(2)).map(|segment| urlencoding_decode(segment)))
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or_else(|| format!("video-{}", chrono_time()));
+    safe_filename(&format!("{stem}.{ext}"))
+}
+
+fn urlencoding_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            if let Ok(value) = u8::from_str_radix(&input[index + 1..index + 3], 16) {
+                output.push(value);
+                index += 3;
+                continue;
+            }
+        }
+        output.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8(output).unwrap_or_else(|_| input.to_string())
+}
+
+const LAN_PAGE: &str = r##"<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Video Scout · 局域网下载</title>
+<style>
+*{box-sizing:border-box;margin:0}
+body{font-family:-apple-system,'PingFang SC',sans-serif;background:#f6f8fb;color:#1a2636;min-height:100vh;padding:20px 14px 40px}
+.wrap{max-width:560px;margin:0 auto}
+h1{font-size:20px;margin:14px 0 4px}
+.sub{color:#8490a0;font-size:12px;margin-bottom:18px}
+.card{background:#fff;border:1px solid #e8edf3;border-radius:12px;padding:16px;margin-bottom:16px}
+textarea{width:100%;min-height:110px;border:1px solid #dfe6f0;border-radius:8px;padding:10px;font-size:13px;font-family:inherit;resize:vertical}
+textarea:focus,.row input:focus{outline:none;border-color:#426bdb}
+.row{display:flex;gap:8px;margin-top:10px}
+.row input{flex:1;min-width:0;height:38px;border:1px solid #dfe6f0;border-radius:8px;padding:0 10px;font-size:13px}
+button{height:38px;padding:0 16px;border:0;border-radius:8px;background:#426bdb;color:#fff;font-size:13px;font-weight:600;cursor:pointer}
+button:disabled{opacity:.6}
+.banner{display:none;margin-top:10px;padding:9px 12px;border-radius:8px;font-size:12px;background:#f3f7ff;border:1px solid #d5e0f5;color:#3d529e;word-break:break-all}
+.banner.error{background:#fdf3f3;border-color:#f0c8c8;color:#b04a4a}
+.section-title{font-size:12px;color:#8490a0;margin:18px 0 8px}
+.task{padding:10px 0;border-bottom:1px solid #eef1f5}
+.task:last-child{border-bottom:0}
+.task-top{display:flex;justify-content:space-between;gap:10px;font-size:13px;font-weight:600}
+.task-top span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.task-state{flex:none;font-weight:500;font-size:11px;color:#8490a0}
+.task-meta{margin-top:4px;font-size:11px;color:#97a2af}
+.task-bar{margin-top:6px;height:4px;border-radius:2px;background:#e9eef7;overflow:hidden}
+.task-bar i{display:block;height:100%;background:#4a72d9;border-radius:2px}
+.task-bar.paused i{background:#cfa54e}
+.state-complete{color:#169b78}.state-failed{color:#c45f5f}
+.group{border:1px solid #e8edf3;border-radius:10px;margin-bottom:10px;overflow:hidden}
+.group-head{display:flex;align-items:center;gap:8px;padding:10px 12px;background:#f8fafd;border-bottom:1px solid #eef1f5}
+.group-head label{display:flex;align-items:center;gap:7px;flex:1;min-width:0;font-size:13px;font-weight:600;cursor:pointer}
+.group-head label span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.group-head small{flex:none;color:#97a2af;font-weight:400;font-size:11px}
+.group-head button{height:28px;padding:0 10px;font-size:11px;flex:none;background:#eef3fd;color:#3d529e}
+.file-row{display:flex;align-items:center;gap:8px;padding:9px 12px;border-bottom:1px solid #f2f5f9;font-size:12px;cursor:pointer}
+.file-row:last-child{border-bottom:0}
+.file-row .file-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.file-row .file-size{flex:none;color:#97a2af;font-size:11px}
+input[type=checkbox]{accent-color:#426bdb;width:15px;height:15px;flex:none}
+.file-actions{display:flex;align-items:center;gap:10px;margin-bottom:10px}
+.file-actions .count{flex:1;color:#8490a0;font-size:12px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Video Scout 局域网下载</h1>
+  <div class="sub">提交播放页或直链地址，由电脑端探测并下载到本机</div>
+  <div class="card">
+    <textarea id="urls" placeholder="每行一个地址，支持播放页或直链（m3u8 / mp4…）"></textarea>
+    <div class="row">
+      <input id="subdir" list="dir-list" placeholder="保存到子目录（可选，不存在会自动创建）" autocomplete="off">
+      <datalist id="dir-list"></datalist>
+      <button id="submit">下载</button>
+    </div>
+    <div class="banner" id="banner"></div>
+  </div>
+  <div class="section-title">下载任务</div>
+  <div class="card" id="tasks"></div>
+  <div class="section-title">已下载的视频（可下载到本设备）</div>
+  <div class="file-actions">
+    <span class="count" id="sel-count">未选择文件</span>
+    <button id="download-selected" disabled>下载选中</button>
+  </div>
+  <div id="files"></div>
+</div>
+<script>
+const banner = document.getElementById('banner');
+function showBanner(text, error) { banner.style.display = 'block'; banner.className = error ? 'banner error' : 'banner'; banner.textContent = text; }
+const stateName = { downloading: '下载中', queued: '排队中', complete: '已完成', failed: '失败', canceled: '已取消', interrupted: '已中断' };
+function esc(text) { return String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;'); }
+function fmtSize(bytes) {
+  if (!bytes) return '0 B';
+  const units = ['B', 'KB', 'MB', 'GB'];
+  let value = bytes, unit = 0;
+  while (value >= 1024 && unit < units.length - 1) { value /= 1024; unit++; }
+  return (value >= 100 ? Math.round(value) : value.toFixed(1)) + ' ' + units[unit];
+}
+async function refreshTasks() {
+  try {
+    const tasks = await (await fetch('/api/tasks')).json();
+    const box = document.getElementById('tasks');
+    if (!tasks.length) { box.innerHTML = '<div class="task-meta">暂无任务</div>'; return; }
+    box.innerHTML = tasks.slice().reverse().map(task => {
+      const known = task.total > 0;
+      const pct = task.status === 'complete' ? 100 : known ? Math.round(Math.min(task.received / task.total, 1) * 100) : 0;
+      const meta = task.error ? task.error : task.unit === 'segments' ? `${task.received} / ${task.total ?? '?'} 个分片` : '';
+      const paused = ['failed', 'canceled', 'interrupted'].includes(task.status) ? ' paused' : '';
+      return `<div class="task"><div class="task-top"><span>${esc(task.filename)}</span><span class="task-state state-${task.status}">${stateName[task.status] || task.status}${known || task.status === 'complete' ? ' ' + pct + '%' : ''}</span></div><div class="task-meta">${esc(meta)}</div><div class="task-bar${paused}"><i style="width:${pct}%"></i></div></div>`;
+    }).join('');
+  } catch (e) {}
+}
+async function refreshDirs() {
+  try {
+    const dirs = await (await fetch('/api/dirs')).json();
+    document.getElementById('dir-list').innerHTML = dirs.map(dir => `<option value="${esc(dir)}"></option>`).join('');
+  } catch (e) {}
+}
+async function refreshFiles() {
+  try {
+    const data = await (await fetch('/api/files')).json();
+    renderFiles(data.groups || []);
+  } catch (e) {}
+}
+function filePath(dir, name) { return dir ? dir + '/' + name : name; }
+function renderFiles(groups) {
+  const box = document.getElementById('files');
+  const nonEmpty = groups.filter(group => group.files.length);
+  if (!nonEmpty.length) { box.innerHTML = '<div class="card"><div class="task-meta">还没有已下载的视频</div></div>'; updateSelCount(); return; }
+  box.innerHTML = nonEmpty.map((group, gi) => {
+    const total = group.files.reduce((sum, file) => sum + file.size, 0);
+    const rows = group.files.map(file => `<label class="file-row"><input type="checkbox" class="file-check" data-path="${esc(filePath(group.dir, file.name))}"><span class="file-name">${esc(file.name)}</span><span class="file-size">${fmtSize(file.size)}</span></label>`).join('');
+    return `<div class="group"><div class="group-head"><label><input type="checkbox" class="group-check" data-group="${gi}"><span>${esc(group.dir || '下载根目录')}</span></label><small>${group.files.length} 个 · ${fmtSize(total)}</small><button type="button" class="group-download" data-group="${gi}">全部下载</button></div>${rows}</div>`;
+  }).join('');
+  box.querySelectorAll('.group-check').forEach(box2 => box2.addEventListener('change', () => {
+    const group = nonEmpty[Number(box2.dataset.group)];
+    group.files.forEach(file => {
+      const input = document.querySelector(`.file-check[data-path="${CSS.escape(filePath(group.dir, file.name))}"]`);
+      if (input) input.checked = box2.checked;
+    });
+    updateSelCount();
+  }));
+  box.querySelectorAll('.group-download').forEach(btn => btn.addEventListener('click', () => {
+    const group = nonEmpty[Number(btn.dataset.group)];
+    downloadPaths(group.files.map(file => filePath(group.dir, file.name)));
+  }));
+  box.querySelectorAll('.file-check').forEach(input => input.addEventListener('change', updateSelCount));
+  updateSelCount();
+}
+function selectedPaths() { return [...document.querySelectorAll('.file-check:checked')].map(input => input.dataset.path); }
+function updateSelCount() {
+  const paths = selectedPaths();
+  document.getElementById('sel-count').textContent = paths.length ? `已选 ${paths.length} 个文件` : '未选择文件';
+  document.getElementById('download-selected').disabled = !paths.length;
+}
+function downloadPaths(paths) {
+  if (!paths.length) return;
+  showBanner(`开始逐个下载 ${paths.length} 个文件；若浏览器提示"允许多个文件下载"请点允许`);
+  paths.forEach((path, index) => {
+    setTimeout(() => {
+      const iframe = document.createElement('iframe');
+      iframe.style.display = 'none';
+      iframe.src = '/files?path=' + encodeURIComponent(path);
+      document.body.append(iframe);
+      setTimeout(() => iframe.remove(), 60000);
+    }, index * 400);
+  });
+}
+document.getElementById('download-selected').addEventListener('click', () => downloadPaths(selectedPaths()));
+document.getElementById('submit').addEventListener('click', async () => {
+  const urls = document.getElementById('urls').value.split('\n').map(line => line.trim()).filter(Boolean);
+  if (!urls.length) { showBanner('请先填写至少一个地址', true); return; }
+  const button = document.getElementById('submit');
+  button.disabled = true;
+  showBanner('正在提交，播放页需要探测媒体地址，请稍候…');
+  try {
+    const result = await (await fetch('/api/download', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ urls, subdir: document.getElementById('subdir').value.trim() || null }) })).json();
+    if (result.error) { showBanner(result.error, true); }
+    else {
+      const failText = result.failed && result.failed.length ? `，${result.failed.length} 个失败：` + result.failed.map(item => item.reason).join('；') : '';
+      showBanner(`已接受 ${result.accepted} 个任务${failText}`, !!(result.failed && result.failed.length));
+      if (result.accepted) document.getElementById('urls').value = '';
+      refreshTasks();
+    }
+  } catch (e) { showBanner('提交失败：' + e, true); }
+  button.disabled = false;
+});
+refreshTasks(); refreshDirs(); refreshFiles();
+setInterval(refreshTasks, 3000); setInterval(refreshFiles, 8000);
+</script>
+</body>
+</html>"##;
 
 pub fn run() {
     tauri::Builder::default()
@@ -1393,10 +2251,32 @@ pub fn run() {
                 })
                 .unwrap_or_default();
             debug_log(&format!("[setup] loaded llmApiUrl: {:?}", settings.llm_api_url));
-            app.manage(AppState::new(settings, settings_path));
+            let tasks_path = app.path().app_config_dir()?.join("tasks.json");
+            let mut tasks: HashMap<String, TaskRecord> = std::fs::read(&tasks_path).ok()
+                .and_then(|contents| serde_json::from_slice::<Vec<TaskRecord>>(&contents).ok())
+                .unwrap_or_default()
+                .into_iter().map(|record| (record.id.clone(), record)).collect();
+            // 上次退出时仍在进行中的任务标记为已中断，等用户手动继续
+            let mut dirty = false;
+            for record in tasks.values_mut() {
+                if record.status == "downloading" || record.status == "queued" {
+                    record.status = "interrupted".into();
+                    dirty = true;
+                }
+            }
+            if dirty { save_tasks_locked(&tasks, &tasks_path); }
+            debug_log(&format!("[setup] loaded {} persisted tasks", tasks.len()));
+            let lan_enabled = settings.lan_enabled;
+            let lan_port = settings.lan_port;
+            app.manage(AppState::new(settings, settings_path, tasks, tasks_path));
+            if lan_enabled {
+                if let Err(error) = start_lan_server(&app.handle(), lan_port) {
+                    debug_log(&format!("[setup] lan server autostart failed: {error}"));
+                }
+            }
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![open_page, open_visible_page, capture_media, visible_log, report_page_links, get_media, get_settings, save_settings, start_download, cancel_download, clear_media, analyze_episodes, analyze_page_links, batch_download])
+        .invoke_handler(tauri::generate_handler![open_page, open_visible_page, capture_media, visible_log, report_page_links, get_media, get_settings, save_settings, start_download, cancel_download, retry_download, delete_task, get_tasks, clear_completed_tasks, show_in_folder, clear_media, analyze_episodes, analyze_page_links, batch_download, get_lan_info])
         .run(tauri::generate_context!("Tauri.toml"))
         .expect("Video Scout failed to start");
 }
