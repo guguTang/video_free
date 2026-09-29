@@ -8,6 +8,7 @@ type MediaItem = {
   kind: string;
   sourceUrl: string;
   capturedAt: string;
+  pageTitle?: string;
 };
 
 type DownloadUpdate = {
@@ -117,8 +118,29 @@ function updateBrowserSourceFields() {
 
 const GENERIC_SEGMENTS = new Set(["index", "video", "videos", "hls", "playlist", "main", "master", "media", "stream", "watch", "play", "vod", "output", "chunklist", "static", "assets", "file", "files", "data", "content", "src", "cdn"]);
 
-function safeFilename(url: string, kind: string): string {
+function safeFilename(url: string, kind: string, sourceUrl?: string, pageTitle?: string): string {
   const ext = kind === "m3u8" ? "ts" : kind;
+  // Prefer the page title extracted from HTML — it's the most meaningful name.
+  if (pageTitle && pageTitle.length > 1 && pageTitle.length < 120) {
+    const cleaned = pageTitle.replace(/[\\/:*?"<>|]+/g, "_").trim().replace(/^\.+|\.+$/, "");
+    if (cleaned.length > 1) return `${cleaned}.${ext}`;
+  }
+  // Try to extract a meaningful name from the source (page) URL
+  if (sourceUrl) {
+    try {
+      const sourceParsed = new URL(sourceUrl);
+      const sourceSegments = decodeURIComponent(sourceParsed.pathname).split("/").filter(Boolean);
+      const sourceMeaningful = sourceSegments
+        .map((segment) => segment.replace(/\.[^.]+$/, ""))
+        .filter((segment) => segment && !GENERIC_SEGMENTS.has(segment.toLowerCase()));
+      // For player pages like /player/321-1-221.html, extract the last meaningful segment
+      const lastMeaningful = sourceMeaningful[sourceMeaningful.length - 1];
+      if (lastMeaningful && lastMeaningful.length > 2 && lastMeaningful.length < 100) {
+        return `${lastMeaningful.replace(/[\\/:*?"<>|]+/g, "_").slice(0, 120)}.${ext}`;
+      }
+    } catch {}
+  }
+  // Fall back to extracting from the media URL
   try {
     const parsed = new URL(url);
     const segments = decodeURIComponent(parsed.pathname).split("/").filter(Boolean);
@@ -165,7 +187,7 @@ function renderMedia() {
     const details = document.createElement("div");
     details.className = "media-details";
     const title = document.createElement("strong");
-    title.textContent = safeFilename(item.url, item.kind);
+    title.textContent = safeFilename(item.url, item.kind, item.sourceUrl, item.pageTitle);
     const url = document.createElement("div");
     url.className = "media-url";
     url.textContent = item.url;
@@ -189,7 +211,7 @@ function escapeHtml(value: string) {
 
 async function startDownload(item: MediaItem, button: HTMLButtonElement) {
   const id = crypto.randomUUID();
-  const filename = safeFilename(item.url, item.kind);
+  const filename = safeFilename(item.url, item.kind, item.sourceUrl, item.pageTitle);
   const task: DownloadTask = { id, filename, sourceUrl: item.url, status: "queued", received: 0 };
   tasks.set(id, task);
   renderTasks();
@@ -396,6 +418,7 @@ document.querySelector<HTMLButtonElement>("#batch-open-visible-btn")!.addEventLi
   try {
     const url = formatUrl(input.value);
     input.value = url;
+    lastAnalyzedUrl = "";
     showBatchProgress("已在原生窗口打开页面。如有 Cloudflare 验证请手动点击，页面完全加载后会自动提取剧集列表…");
     await invoke("open_visible_page", { url });
   } catch (error) {
@@ -404,16 +427,17 @@ document.querySelector<HTMLButtonElement>("#batch-open-visible-btn")!.addEventLi
 });
 
 let unlistenPageLinks: UnlistenFn | undefined;
+let lastAnalyzedUrl = "";
 
 async function handlePageLinks(payload: { url: string; title: string; links: string[] }) {
-  // If the batch tab isn't active or no links, don't spam
   if (payload.links.length === 0) return;
-  // If user is currently looking at Cloudflare challenge, ignore
   const lowerTitle = payload.title.toLowerCase();
   if (lowerTitle.includes("请稍候") || lowerTitle.includes("just a moment") || lowerTitle.includes("checking your browser")) {
     showBatchProgress(`页面正在通过验证（${payload.title}），请稍候…`);
     return;
   }
+  if (payload.url === lastAnalyzedUrl) return;
+  lastAnalyzedUrl = payload.url;
   showBatchProgress(`检测到页面「${payload.title}」已加载（共 ${payload.links.length} 个链接），正在呼叫 LLM 分析剧集…`);
   try {
     batchBusy = true;

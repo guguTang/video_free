@@ -25,6 +25,8 @@ struct MediaItem {
     kind: String,
     source_url: String,
     captured_at: String,
+    #[serde(default)]
+    page_title: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -170,7 +172,7 @@ fn app_download_dir(app: &AppHandle, settings: &AppSettings) -> Result<PathBuf, 
     Ok(path)
 }
 
-fn emit_captured(app: &AppHandle, state: &AppState, url: String, source_url: String, mime_type: Option<&str>) -> Result<(), String> {
+fn emit_captured(app: &AppHandle, state: &AppState, url: String, source_url: String, mime_type: Option<&str>, page_title: Option<&str>) -> Result<(), String> {
     if !is_allowed_url(&url) { debug_log(&format!("[emit_captured] URL not allowed: {url}")); return Ok(()); }
     // Skip HLS/DASH segment streams (.ts, .m4s, etc.) — only capture playlists and full video files.
     if let Some(mime) = mime_type {
@@ -188,7 +190,7 @@ fn emit_captured(app: &AppHandle, state: &AppState, url: String, source_url: Str
         else { None }
     });
     let Some(kind) = kind else { debug_log(&format!("[emit_captured] no kind for: {url}")); return Ok(()); };
-    let item = MediaItem { id: url.clone(), url: url.clone(), kind: kind.clone(), source_url, captured_at: chrono_time() };
+    let item = MediaItem { id: url.clone(), url: url.clone(), kind: kind.clone(), source_url, captured_at: chrono_time(), page_title: page_title.unwrap_or_default().to_string() };
     debug_log(&format!("[emit_captured] inserting: {url} kind={kind}"));
     state.media.lock().map_err(|_| "媒体列表锁定失败".to_string())?.insert(item.id.clone(), item.clone());
     let emit_result = app.emit("media-found", item);
@@ -206,6 +208,7 @@ fn media_from_resource_type(resource_type: &str, mime_type: &str, url: &str) -> 
 }
 
 async fn browser_executable(app: &AppHandle, settings: &AppSettings) -> Result<PathBuf, String> {
+    debug_log(&format!("[browser_executable] browser_source={:?} local_chromium_path={:?}", settings.browser_source, settings.local_chromium_path));
     if settings.browser_source == "local" {
         let path = PathBuf::from(settings.local_chromium_path.trim());
         if settings.local_chromium_path.trim().is_empty() {
@@ -214,6 +217,7 @@ async fn browser_executable(app: &AppHandle, settings: &AppSettings) -> Result<P
         if !path.is_file() {
             return Err("指定的 Chromium 可执行文件不存在".into());
         }
+        debug_log(&format!("[browser_executable] using local Chrome: {}", path.display()));
         return Ok(path);
     }
     let mut cache = app.path().app_cache_dir().map_err(|error| { debug_log(&format!("[browser_executable] app_cache_dir failed: {error}")); error.to_string() })?;
@@ -342,7 +346,7 @@ async fn open_headless_page(app: AppHandle, state: &AppState, url: &str, setting
                     if media_from_resource_type(&format!("{:?}", response.r#type), &response.response.mime_type, &response.response.url) {
                         debug_log(&format!("[listener] media response: {} ({})", response.response.url, response.response.mime_type));
                         let source_url = media_app.state::<AppState>().headless_page_url.lock().map(|url| url.clone()).unwrap_or_default();
-                        let _ = emit_captured(&media_app, &media_app.state::<AppState>(), response.response.url.clone(), source_url, Some(&response.response.mime_type));
+                        let _ = emit_captured(&media_app, &media_app.state::<AppState>(), response.response.url.clone(), source_url, Some(&response.response.mime_type), None);
                     }
                 }
                 request = requests.next() => {
@@ -352,7 +356,7 @@ async fn open_headless_page(app: AppHandle, state: &AppState, url: &str, setting
                                 if classify_media(req_url).is_some() && !is_ts {
                         debug_log(&format!("[listener] media request: {}", request.request.url));
                         let source_url = media_app.state::<AppState>().headless_page_url.lock().map(|url| url.clone()).unwrap_or_default();
-                        let _ = emit_captured(&media_app, &media_app.state::<AppState>(), request.request.url.clone(), source_url, None);
+                        let _ = emit_captured(&media_app, &media_app.state::<AppState>(), request.request.url.clone(), source_url, None, None);
                     }
                 }
             }
@@ -377,6 +381,28 @@ async fn open_headless_page(app: AppHandle, state: &AppState, url: &str, setting
                     *current = final_url;
                 }
             }
+            let source_url = state.headless_page_url.lock().map(|u| u.clone()).unwrap_or_default();
+            let scan_script = r#"(() => {
+                const results = [];
+                const add = (url) => { try { const u = new URL(url, location.href); if (/\.(m3u8|mpd|mp4|m4v|mov|webm|flv)(?:$|[?#])/i.test(u.href)) results.push(u.href); } catch {} };
+                const addFromParams = (href) => { try { const u = new URL(href); for (const v of u.searchParams.values()) { try { const mu = new URL(v, href); if (/\.(m3u8|mpd|mp4|m4v|mov|webm|flv)(?:$|[?#])/i.test(mu.href)) results.push(mu.href); } catch {} } } catch {} };
+                add(location.href); addFromParams(location.href);
+                document.querySelectorAll('video, source').forEach(el => add(el.currentSrc || el.src));
+                document.querySelectorAll('iframe').forEach(f => { try { add(f.contentWindow.location.href); addFromParams(f.contentWindow.location.href); } catch {} });
+                const raw = document.documentElement?.innerHTML || '';
+                const text = raw.replace(/\\\//g, '/');
+                const re = /(?:https?:)?[^\s"'<>\\]+\.(?:m3u8|mpd|mp4|m4v|mov|webm|flv)(?:\?[^\s"'<>\\]*)?/ig;
+                for (const m of text.matchAll(re)) add(m[0]);
+                return [...new Set(results)];
+            })()"#;
+            if let Ok(Ok(value)) = tokio::time::timeout(std::time::Duration::from_secs(5), page.evaluate(scan_script)).await {
+                if let Ok(urls) = value.into_value::<Vec<String>>() {
+                    for media_url in urls {
+                        debug_log(&format!("[open_headless_page] html scan found: {media_url}"));
+                        let _ = emit_captured(&app, state, media_url, source_url.clone(), None, None);
+                    }
+                }
+            }
         }
         Ok(Err(error)) => {
             debug_log(&format!("[open_headless_page] navigation error: {error}"));
@@ -387,17 +413,21 @@ async fn open_headless_page(app: AppHandle, state: &AppState, url: &str, setting
     Ok(())
 }
 
-async fn open_visible_page_inner(app: AppHandle, url: String) -> Result<(), String> {
+async fn open_visible_page_inner(app: AppHandle, _state: &AppState, url: String) -> Result<(), String> {
     if let Some(window) = app.get_webview_window("browser") {
-        window.navigate(Url::parse(&url).map_err(|error| error.to_string())?).map_err(|error| error.to_string())?;
-    } else {
+        let _ = window.close();
+    }
+    {
         let initialization_script = r#"
           (() => {
+            const vlog = (msg) => { try { window.__TAURI_INTERNALS__?.invoke('visible_log', { message: '[' + location.href.slice(0, 80) + '] ' + msg }).catch(() => {}); } catch {} };
+            vlog('init script loaded');
             const isMedia = (url, type = '') => /\.(m3u8|mpd|mp4|m4v|mov|webm|flv)(?:$|[?#])/i.test(url || '') || /mpegurl|dash\+xml|video\//i.test(type || '');
             const send = (url, type = '') => {
               try {
                 const absoluteUrl = new URL(url, location.href).href;
                 if (!isMedia(absoluteUrl, type)) return;
+                vlog('media found: ' + absoluteUrl);
                 const invoke = window.__TAURI_INTERNALS__?.invoke;
                 if (typeof invoke !== 'function') {
                   console.error('[Video Scout] Tauri invoke unavailable', location.href);
@@ -426,6 +456,21 @@ async fn open_visible_page_inner(app: AppHandle, url: String) -> Result<(), Stri
               const url = element.currentSrc || element.src;
               if (url) send(url);
             });
+            const scanHtmlForMedia = () => {
+              try {
+                const raw = document.documentElement?.innerHTML || '';
+                const text = raw.replace(/\\\//g, '/');
+                vlog('scanHtmlForMedia: html length=' + text.length);
+                const re = /(?:https?:)?[^\s\"'<>\\]+\.(?:m3u8|mpd|mp4|m4v|mov|webm|flv)(?:\?[^\s\"'<>\\]*)?/ig;
+                var matchCount = 0;
+                for (const match of text.matchAll(re)) {
+                  matchCount++;
+                  try { send(new URL(match[0], location.href).href); } catch { send(match[0]); }
+                }
+                vlog('scanHtmlForMedia: found ' + matchCount + ' regex matches');
+                try { const params = new URL(location.href).searchParams; for (const v of params.values()) { if (/\.(m3u8|mpd|mp4|m4v|mov|webm|flv)(?:$|[?#])/i.test(v)) send(new URL(v, location.href).href); } } catch {}
+              } catch (e) { vlog('scanHtmlForMedia error: ' + e); }
+            };
             const extractAndSendLinks = () => {
               try {
                 const links = [];
@@ -439,17 +484,38 @@ async fn open_visible_page_inner(app: AppHandle, url: String) -> Result<(), Stri
                   seen.add(key);
                   links.push(text + '|' + href);
                 }
+                vlog('extractAndSendLinks: found ' + links.length + ' links, title=' + document.title);
                 const invoke = window.__TAURI_INTERNALS__?.invoke;
                 if (typeof invoke === 'function' && links.length > 0) {
                   invoke('report_page_links', { payload: { url: location.href, title: document.title, links: links.slice(0, 600) } }).catch(() => {});
                 }
-              } catch {}
+              } catch (e) { vlog('extractAndSendLinks error: ' + e); }
             };
-            new MutationObserver(inspect).observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ['src'] });
+            var lastLinkCount = 0;
+            var debounceTimer = null;
+            const extractDebounced = () => {
+              if (debounceTimer) clearTimeout(debounceTimer);
+              debounceTimer = setTimeout(() => { debounceTimer = null; extractAndSendLinks(); }, 3000);
+            };
+            new MutationObserver((records) => {
+              inspect();
+              if (!debounceTimer) {
+                for (const r of records) {
+                  for (const n of r.addedNodes) {
+                    if (n.nodeType === 1 && (n.tagName === 'A' || n.querySelector?.('a'))) {
+                      const cur = document.querySelectorAll('a[href]').length;
+                      if (cur !== lastLinkCount) { lastLinkCount = cur; extractDebounced(); }
+                      return;
+                    }
+                  }
+                }
+              }
+            }).observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ['src'] });
             document.addEventListener('play', inspect, true);
-            window.addEventListener('load', () => setTimeout(extractAndSendLinks, 1500));
-            document.addEventListener('DOMContentLoaded', () => setTimeout(extractAndSendLinks, 1000));
+            window.addEventListener('load', () => { vlog('window load event'); setTimeout(() => { inspect(); scanHtmlForMedia(); }, 2000); setTimeout(extractAndSendLinks, 5000); });
+            vlog('init script executing at ' + location.href);
             inspect();
+            scanHtmlForMedia();
           })();
         "#;
         WebviewWindowBuilder::new(&app, "browser", WebviewUrl::External(Url::parse(&url).map_err(|error| error.to_string())?))
@@ -461,16 +527,21 @@ async fn open_visible_page_inner(app: AppHandle, url: String) -> Result<(), Stri
             .on_page_load(|webview, payload| {
                 if payload.event() == tauri::webview::PageLoadEvent::Finished {
                     let page_url = payload.url().to_string();
+                    debug_log(&format!("[on_page_load] fired for url={page_url}"));
                     let script = format!(
                         r#"(() => {{
                           const candidates = [];
                           const add = (url) => {{ try {{ const u = new URL(url, location.href); if (/\.(m3u8|mpd|mp4|m4v|mov|webm|flv)(?:$|[?#])/i.test(u.href)) candidates.push(u.href); }} catch {{}} }};
+                          const addFromParams = (href) => {{ try {{ const u = new URL(href); for (const v of u.searchParams.values()) {{ try {{ const mu = new URL(v, href); if (/\.(m3u8|mpd|mp4|m4v|mov|webm|flv)(?:$|[?#])/i.test(mu.href)) candidates.push(mu.href); }} catch {{}} }} }} catch {{}} }};
                           add(location.href);
+                          addFromParams(location.href);
                           document.querySelectorAll('video, source').forEach((el) => add(el.currentSrc || el.src));
-                          for (const frame of document.querySelectorAll('iframe')) {{ try {{ add(frame.contentWindow.location.href); }} catch {{}} }}
-                          const text = document.documentElement?.innerHTML || '';
+                          for (const frame of document.querySelectorAll('iframe')) {{ try {{ const furl = frame.contentWindow.location.href; add(furl); addFromParams(furl); }} catch {{}} }}
+                          const raw = document.documentElement?.innerHTML || '';
+                          const text = raw.replace(/\\\\\//g, '/');
                           for (const match of text.matchAll(/(?:https?:)?[^\\s\\"'<>\\\\]+\\.(?:m3u8|mpd|mp4|m4v|mov|webm|flv)(?:\\?[^\\s\\"'<>\\\\]*)?/ig)) add(match[0]);
-                          for (const frame of document.querySelectorAll('iframe')) {{ try {{ const frameUrl = frame.contentWindow.location.href; const frameText = frame.contentDocument?.documentElement?.innerHTML || ''; for (const match of frameText.matchAll(/(?:https?:)?[^\\s\\"'<>\\\\]+\\.(?:m3u8|mpd|mp4|m4v|mov|webm|flv)(?:\\?[^\\s\\"'<>\\\\]*)?/ig)) candidates.push(new URL(match[0], frameUrl).href); }} catch {{}} }}
+                          for (const frame of document.querySelectorAll('iframe')) {{ try {{ const frameUrl = frame.contentWindow.location.href; const frameRaw = frame.contentDocument?.documentElement?.innerHTML || ''; const frameText = frameRaw.replace(/\\\\\//g, '/'); for (const match of frameText.matchAll(/(?:https?:)?[^\\s\\"'<>\\\\]+\\.(?:m3u8|mpd|mp4|m4v|mov|webm|flv)(?:\\?[^\\s\\"'<>\\\\]*)?/ig)) candidates.push(new URL(match[0], frameUrl).href); }} catch {{}} }}
+                          try {{ window.__TAURI_INTERNALS__?.invoke('visible_log', {{ message: '[on_page_load] candidates=' + new Set(candidates).size + ' for ' + location.href }}).catch(() => {{}}); }} catch {{}}
                           for (const url of new Set(candidates)) window.__TAURI_INTERNALS__?.invoke('capture_media', {{ payload: {{ id: url, url, sourceUrl: {source_url:?} }} }}).catch(() => {{}});
                         }})();"#,
                         source_url = page_url
@@ -481,7 +552,179 @@ async fn open_visible_page_inner(app: AppHandle, url: String) -> Result<(), Stri
             .build()
             .map_err(|error| error.to_string())?;
     }
+    // Also scan the page HTML from Rust side (bypasses JS injection issues)
+    let scan_url = url.clone();
+    let scan_app = app.clone();
+    tokio::spawn(async move {
+        let (media_urls, page_title) = scan_page_html_for_media(&scan_url).await;
+        let state = scan_app.state::<AppState>();
+        let title_ref = page_title.as_deref();
+        for media_url in media_urls {
+            debug_log(&format!("[open_visible_page] rust scan found: {media_url}"));
+            let _ = emit_captured(&scan_app, &state, media_url, scan_url.clone(), None, title_ref);
+        }
+    });
     Ok(())
+}
+
+/// Fetch a page's HTML from Rust and scan for media URLs (m3u8, mp4, etc.).
+/// This bypasses JS injection issues in external webviews.
+/// Also extracts the video title from `player_aaaa` JS variables when present.
+async fn scan_page_html_for_media(url: &str) -> (Vec<String>, Option<String>) {
+    let client = match Client::builder()
+        .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+        .build() {
+        Ok(c) => c,
+        Err(e) => { debug_log(&format!("[scan_page_html_for_media] client build failed: {e}")); return (vec![], None); }
+    };
+    let response = match client.get(url).send().await {
+        Ok(r) => r,
+        Err(e) => { debug_log(&format!("[scan_page_html_for_media] fetch failed: {e}")); return (vec![], None); }
+    };
+    if !response.status().is_success() {
+        debug_log(&format!("[scan_page_html_for_media] status={}", response.status()));
+        return (vec![], None);
+    }
+    let html = match response.text().await {
+        Ok(t) => t,
+        Err(e) => { debug_log(&format!("[scan_page_html_for_media] read body failed: {e}")); return (vec![], None); }
+    };
+    debug_log(&format!("[scan_page_html_for_media] html length={}", html.len()));
+
+    // Unescape JSON-escaped strings (\/ → /) so that URLs inside JS variables
+    // like `player_aaaa={"url":"https:\/\/...\/index.m3u8"}` can be matched.
+    let unescaped = html.replace("\\/", "/");
+
+    let mut results = Vec::new();
+    let re = regex::Regex::new(r#"(?i)(?:https?:)?[^\s"'<>\\]+\.(?:m3u8|mpd|mp4|m4v|mov|webm|flv)(?:\?[^\s"'<>\\]*)?"#).unwrap();
+    for cap in re.captures_iter(&unescaped) {
+        let matched = cap.get(0).unwrap().as_str();
+        let absolute = if matched.starts_with("//") {
+            format!("https:{}", matched)
+        } else if matched.starts_with("/") {
+            if let Ok(base) = Url::parse(url) {
+                format!("{}://{}{}", base.scheme(), base.host_str().unwrap_or(""), matched)
+            } else {
+                matched.to_string()
+            }
+        } else if matched.starts_with("http") {
+            matched.to_string()
+        } else {
+            continue;
+        };
+        if !results.contains(&absolute) {
+            debug_log(&format!("[scan_page_html_for_media] found: {absolute}"));
+            results.push(absolute);
+        }
+    }
+
+    // Extract video URL and title from `player_aaaa` JS variable (common on Chinese video sites).
+    // The URL here is the real playable source, more reliable than regex-scanning the HTML.
+    let (player_url, player_title) = extract_player_info(&unescaped);
+    let resolved_url = if let Some(ref purl) = player_url {
+        resolve_share_url(&client, purl).await.or_else(|| Some(purl.clone()))
+    } else {
+        None
+    };
+    if let Some(ref rurl) = resolved_url {
+        if !results.contains(rurl) {
+            debug_log(&format!("[scan_page_html_for_media] player url (priority): {rurl}"));
+            results.insert(0, rurl.clone());
+        }
+    }
+    let page_title = player_title.or_else(|| extract_page_title(&html));
+    if let Some(ref title) = page_title {
+        debug_log(&format!("[scan_page_html_for_media] page_title={title:?}"));
+    }
+    (results, page_title)
+}
+
+/// If a player URL is a "share" link (e.g. `https://vip.ffzy-plays.com/share/...`),
+/// fetch the share page and extract the real m3u8 URL from its JS variables.
+async fn resolve_share_url(client: &Client, url: &str) -> Option<String> {
+    if !url.contains("/share/") {
+        debug_log(&format!("[resolve_share_url] not a share URL: {url}"));
+        return None;
+    }
+    debug_log(&format!("[resolve_share_url] resolving: {url}"));
+    let response = match client.get(url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            debug_log(&format!("[resolve_share_url] fetch failed: {e}"));
+            return None;
+        }
+    };
+    if !response.status().is_success() {
+        debug_log(&format!("[resolve_share_url] status={}", response.status()));
+        return None;
+    }
+    let html = match response.text().await {
+        Ok(t) => t,
+        Err(e) => {
+            debug_log(&format!("[resolve_share_url] read body failed: {e}"));
+            return None;
+        }
+    };
+    debug_log(&format!("[resolve_share_url] html length={}", html.len()));
+    let unescaped = html.replace("\\/", "/");
+    let re = match regex::Regex::new(r#"(?i)const\s+url\s*=\s*"([^"]+\.m3u8[^"]*)""#) {
+        Ok(r) => r,
+        Err(e) => {
+            debug_log(&format!("[resolve_share_url] regex build failed: {e}"));
+            return None;
+        }
+    };
+    let Some(cap) = re.captures(&unescaped) else {
+        debug_log(&format!("[resolve_share_url] no m3u8 URL found in share page"));
+        return None;
+    };
+    let path = cap.get(1)?.as_str();
+    debug_log(&format!("[resolve_share_url] extracted path: {path}"));
+    let base = Url::parse(url).ok()?;
+    let resolved = if path.starts_with("http") {
+        path.to_string()
+    } else {
+        base.join(path).ok()?.to_string()
+    };
+    debug_log(&format!("[resolve_share_url] resolved to: {resolved}"));
+    Some(resolved)
+}
+
+/// Extract video URL and episode title from `player_aaaa` or similar JS variables.
+/// Returns (video_url, episode_title).
+fn extract_player_info(html: &str) -> (Option<String>, Option<String>) {
+    let re = match regex::Regex::new(r#"(?i)var\s+player_\w+\s*=\s*(\{[^<]+\})\s*[;<]"#) {
+        Ok(r) => r,
+        Err(_) => return (None, None),
+    };
+    let Some(cap) = re.captures(html) else { return (None, None); };
+    let Some(json_str) = cap.get(1).map(|m| m.as_str()) else { return (None, None); };
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_str) else { return (None, None); };
+    let video_url = parsed["url"].as_str().map(|s| s.to_string()).filter(|s| s.starts_with("http"));
+    let episode_title = parsed["nid"].as_u64().map(|id| {
+        let show_name = parsed["vod_data"]["vod_name"].as_str().unwrap_or("");
+        if show_name.is_empty() {
+            format!("第{id}集")
+        } else {
+            format!("{show_name} 第{id}集")
+        }
+    });
+    if let Some(ref url) = video_url { debug_log(&format!("[extract_player_info] url={url}")); }
+    if let Some(ref title) = episode_title { debug_log(&format!("[extract_player_info] title={title}")); }
+    (video_url, episode_title)
+}
+
+fn extract_page_title(html: &str) -> Option<String> {
+    let re = regex::Regex::new(r"(?i)<title[^>]*>([^<]*)</title>").unwrap();
+    let title = re.captures(html)
+        .and_then(|cap| cap.get(1))
+        .map(|m| m.as_str().trim().to_string())
+        .filter(|t| !t.is_empty())?;
+    let cleaned: String = title.chars().map(|c| {
+        if c.is_control() || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') { '_' } else { c }
+    }).collect();
+    let cleaned = cleaned.trim().trim_matches('.').to_string();
+    if cleaned.is_empty() { None } else { Some(cleaned) }
 }
 
 #[tauri::command]
@@ -492,14 +735,21 @@ async fn open_page(app: AppHandle, state: tauri::State<'_, AppState>, url: Strin
     if settings.listening_mode == "headless" {
         open_headless_page(app, &state, &url, &settings).await
     } else {
-        open_visible_page_inner(app, url).await
+        open_visible_page_inner(app, &state, url).await
     }
 }
 
 #[tauri::command]
 fn capture_media(app: AppHandle, state: tauri::State<'_, AppState>, payload: CaptureRequest) -> Result<(), String> {
+    debug_log(&format!("[capture_media] url={} source={}", payload.url, payload.source_url));
     if payload.id != payload.url { return Ok(()); }
-    emit_captured(&app, &state, payload.url, payload.source_url, None)
+    emit_captured(&app, &state, payload.url, payload.source_url, None, None)
+}
+
+#[tauri::command]
+fn visible_log(message: String) -> Result<(), String> {
+    debug_log(&format!("[visible] {message}"));
+    Ok(())
 }
 
 #[tauri::command]
@@ -522,9 +772,9 @@ async fn save_settings(state: tauri::State<'_, AppState>, settings: AppSettings)
 }
 
 #[tauri::command]
-async fn open_visible_page(app: AppHandle, _state: tauri::State<'_, AppState>, url: String) -> Result<(), String> {
+async fn open_visible_page(app: AppHandle, state: tauri::State<'_, AppState>, url: String) -> Result<(), String> {
     if !is_allowed_url(&url) { return Err("请输入有效的 http 或 https 网页地址".into()); }
-    open_visible_page_inner(app, url).await
+    open_visible_page_inner(app, &state, url).await
 }
 
 fn chrono_time() -> String {
@@ -600,6 +850,9 @@ async fn download_hls(app: AppHandle, payload: DownloadRequest, output_dir: Path
     let client = build_client(payload.referer.as_deref())?;
     let mut playlist_url = Url::parse(&payload.url).map_err(|error| error.to_string())?;
     let mut playlist = client.get(playlist_url.clone()).send().await.map_err(|error| error.to_string())?.error_for_status().map_err(|error| error.to_string())?.text().await.map_err(|error| error.to_string())?;
+    if !playlist.trim_start().starts_with("#EXTM3U") {
+        return Err("该地址返回的不是有效的 m3u8 播放列表（可能是网页或错误页面）".to_string());
+    }
     if playlist.lines().any(|line| line.starts_with("#EXT-X-STREAM-INF")) {
         let lines: Vec<&str> = playlist.lines().collect();
         let mut variants = Vec::new();
@@ -613,6 +866,9 @@ async fn download_hls(app: AppHandle, payload: DownloadRequest, output_dir: Path
         }
         playlist_url = variants.into_iter().max_by_key(|variant| variant.0).map(|variant| variant.1).ok_or("主播放列表没有可用的视频流")?;
         playlist = client.get(playlist_url.clone()).send().await.map_err(|error| error.to_string())?.error_for_status().map_err(|error| error.to_string())?.text().await.map_err(|error| error.to_string())?;
+        if !playlist.trim_start().starts_with("#EXTM3U") {
+            return Err("视频流播放列表返回的内容无效（可能是网页或错误页面）".to_string());
+        }
     }
     let media_sequence = playlist.lines().find_map(|line| line.strip_prefix("#EXT-X-MEDIA-SEQUENCE:").and_then(|value| value.parse::<u64>().ok())).unwrap_or(0);
     let mut segments = Vec::new();
@@ -1008,6 +1264,14 @@ async fn capture_episode_media(browser: &Arc<Browser>, page_url: &str) -> Result
         }
         first
     }).await.unwrap_or(None);
+    // If no media was captured from network requests, scan the page HTML for player variables
+    let result = if result.is_none() {
+        debug_log("[capture_episode_media] no media from network, scanning HTML");
+        let (media_urls, _page_title) = scan_page_html_for_media(page_url).await;
+        media_urls.into_iter().next()
+    } else {
+        result
+    };
     // Re-check the URL only after media collection finishes (not right after goto): episode
     // pages commonly redirect via JS (`location.href = ...`) a moment after the initial
     // document loads, which goto() alone would miss.
@@ -1046,7 +1310,7 @@ async fn batch_download(app: AppHandle, state: tauri::State<'_, AppState>, episo
                 let effective_page_url = redirected_to.clone().unwrap_or_else(|| episode.url.clone());
                 let redirect_note = redirected_to.as_deref().map(|u| format!("（页面跳转至 {u}）")).unwrap_or_default();
                 debug_log(&format!("[batch] episode '{}' -> {media_url}{redirect_note}", episode.title));
-                let _ = emit_captured(&app, &state, media_url.clone(), effective_page_url.clone(), None);
+                let _ = emit_captured(&app, &state, media_url.clone(), effective_page_url.clone(), None, None);
                 let payload = DownloadRequest {
                     id: format!("batch-{}-{}", chrono_time(), index),
                     url: media_url,
@@ -1132,7 +1396,7 @@ pub fn run() {
             app.manage(AppState::new(settings, settings_path));
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![open_page, open_visible_page, capture_media, report_page_links, get_media, get_settings, save_settings, start_download, cancel_download, clear_media, analyze_episodes, analyze_page_links, batch_download])
+        .invoke_handler(tauri::generate_handler![open_page, open_visible_page, capture_media, visible_log, report_page_links, get_media, get_settings, save_settings, start_download, cancel_download, clear_media, analyze_episodes, analyze_page_links, batch_download])
         .run(tauri::generate_context!("Tauri.toml"))
         .expect("Video Scout failed to start");
 }
