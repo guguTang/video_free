@@ -37,3 +37,21 @@
 .lan-url-row{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:9px 14px;border:1px solid #d5e0f5;border-radius:8px;background:#f3f7ff}
 .lan-url-row code{color:#3d529e;font:500 12px 'DM Mono',monospace}
 .setting-row input[type=checkbox]{width:18px;height:18px;padding:0;flex:none;accent-color:#426bdb;cursor:pointer}
+#history-btn{height:28px;padding:0 11px;border:1px solid #e9edf3;border-radius:20px;background:#fff;color:#7d8999;font:500 11px 'DM Sans',sans-serif;cursor:pointer}
+#history-btn:hover{border-color:#c6d2e8;color:#426bdb}
+.drawer-overlay{position:fixed;inset:0;background:#1a263655;opacity:0;pointer-events:none;transition:opacity .25s ease;z-index:8}
+.drawer-overlay.open{opacity:1;pointer-events:auto}
+.history-drawer{position:fixed;top:0;right:0;bottom:0;width:min(380px,92vw);padding:20px 18px;border-left:1px solid var(--line);background:#fff;box-shadow:-12px 0 32px #1a263614;display:flex;flex-direction:column;transform:translateX(102%);visibility:hidden;transition:transform .28s ease,visibility .28s;z-index:9}
+.history-drawer.open{transform:none;visibility:visible}
+.drawer-head{display:flex;align-items:flex-start;justify-content:space-between;padding-bottom:12px;border-bottom:1px solid var(--line)}
+.drawer-head h2{margin:0;color:#293648;font:700 16px Manrope,sans-serif}
+.drawer-tools{display:flex;align-items:center;justify-content:space-between;padding:12px 0}
+.drawer-tools span{color:#99a4b2;font:10px 'DM Mono',monospace}
+.history-list{flex:1;display:grid;gap:8px;align-content:start;padding-bottom:10px;overflow-y:auto}
+.history-item{padding:10px 12px;border:1px solid #e8edf3;border-radius:8px;background:#fbfcfe;display:grid;gap:7px}
+.history-url{padding:0;border:0;background:transparent;color:#3d529e;font:11px 'DM Mono',monospace;text-align:left;cursor:pointer;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.history-url:hover{color:#2c3f7d;text-decoration:underline}
+.history-meta{display:flex;align-items:center;justify-content:space-between;gap:10px}
+.history-meta time{color:#a0a9b6;font:10px 'DM Mono',monospace}
+.history-actions{display:flex;gap:6px}
+.history-drawer .empty-state{min-height:120px}

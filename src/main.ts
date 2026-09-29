@@ -54,6 +54,7 @@ type AppSettings = {
 };
 
 type LanInfo = { running: boolean; port: number; urls: string[] };
+type HistoryEntry = { id: string; url: string; kind: string; createdAt: string };
 
 type Episode = { title: string; url: string; show?: string };
 type BatchProgress = { stage: string; message: string; current?: number; total?: number };
@@ -71,7 +72,7 @@ app.innerHTML = `
     <div class="sidebar-bottom"><span class="status-dot"></span><span>本机处理 · 隐私优先</span></div>
   </aside>
   <main class="main-shell">
-    <header class="topbar"><div><span class="breadcrumb">工作区</span><span class="crumb-sep">/</span><strong id="page-title">视频探测器</strong></div><div class="topbar-right"><span class="platform-chip">跨平台桌面版</span><span class="avatar">VS</span></div></header>
+    <header class="topbar"><div><span class="breadcrumb">工作区</span><span class="crumb-sep">/</span><strong id="page-title">视频探测器</strong></div><div class="topbar-right"><button type="button" id="history-btn" title="查看处理过的网址历史">◷ 历史</button><span class="platform-chip">跨平台桌面版</span><span class="avatar">VS</span></div></header>
     <section class="workspace">
       <div id="detector-view">
         <div class="hero"><div class="eyebrow"><span class="eyebrow-line"></span>MEDIA DISCOVERY</div><h1>发现网页中的<br><span>视频资源。</span></h1><p>输入网页地址，在内置浏览器中播放视频，自动捕获可下载的媒体流。</p></div>
@@ -119,6 +120,12 @@ app.innerHTML = `
     </section>
     <footer><span>Video Scout <span class="footer-sep">·</span> 媒体探测与下载</span><span>仅下载你拥有权限保存的内容</span></footer>
   </main>
+  <div class="drawer-overlay" id="history-overlay"></div>
+  <aside class="history-drawer" id="history-drawer" aria-hidden="true">
+    <div class="drawer-head"><div><div class="section-kicker">HISTORY</div><h2 id="history-title">探测历史</h2></div><button id="history-close" class="quiet-button" title="关闭">✕</button></div>
+    <div class="drawer-tools"><span id="history-count">0 条记录</span><button id="history-clear" class="task-btn delete-btn">清空全部</button></div>
+    <div id="history-list" class="history-list"></div>
+  </aside>
 `;
 
 const mediaList = document.querySelector<HTMLDivElement>("#media-list")!;
@@ -417,12 +424,12 @@ document.querySelector<HTMLFormElement>("#url-form")!.addEventListener("submit",
     currentBrowserUrl = formatUrl(input.value);
     input.value = currentBrowserUrl;
     detectBanner.hidden = false;
-    await invoke(visibleCheck.checked ? "open_visible_page" : "open_page", { url: currentBrowserUrl });
+    await invoke(visibleCheck.checked ? "open_visible_page" : "open_page", { url: currentBrowserUrl, kind: "detect" });
   } catch (error) {
     if (!visibleCheck.checked && window.confirm(`无头浏览器未能打开页面：${String(error)}\n\n是否改用可视化窗口？`)) {
       try {
         visibleCheck.checked = true;
-        await invoke("open_visible_page", { url: currentBrowserUrl });
+        await invoke("open_visible_page", { url: currentBrowserUrl, kind: "detect" });
         return;
       } catch (visibleError) {
         input.setCustomValidity(String(visibleError));
@@ -553,7 +560,7 @@ document.querySelector<HTMLFormElement>("#batch-form")!.addEventListener("submit
       input.value = url;
       lastAnalyzedUrl = "";
       showBatchProgress("已在原生窗口打开页面。如有 Cloudflare 验证请手动点击，页面完全加载后会自动提取剧集列表…");
-      await invoke("open_visible_page", { url });
+      await invoke("open_visible_page", { url, kind: "batch" });
     } catch (error) {
       showBatchProgress(`打开页面失败：${String(error)}`, true);
     }
@@ -643,8 +650,112 @@ void listen<BatchProgress>("batch-progress", ({ payload }) => {
   }
 });
 
+// ===== URL 历史抽屉 =====
+
+let historyKind: "detect" | "batch" = "detect";
+let activeView = "探测器";
+
+function formatHistoryTime(createdAt: string): string {
+  const date = new Date(Number(createdAt) * 1000);
+  if (Number.isNaN(date.getTime())) return "";
+  const pad = (value: number) => String(value).padStart(2, "0");
+  return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function renderHistory(entries: HistoryEntry[]) {
+  const list = document.querySelector<HTMLDivElement>("#history-list")!;
+  document.querySelector<HTMLSpanElement>("#history-count")!.textContent = `${entries.length} 条记录`;
+  list.replaceChildren();
+  if (entries.length === 0) {
+    list.innerHTML = `<div class="empty-state task-empty"><strong>暂无历史记录</strong><p>处理过的网址会自动记录在这里。</p></div>`;
+    return;
+  }
+  for (const entry of entries) {
+    const item = document.createElement("div");
+    item.className = "history-item";
+    const urlButton = document.createElement("button");
+    urlButton.type = "button";
+    urlButton.className = "history-url";
+    urlButton.title = "点击填入输入框";
+    urlButton.textContent = entry.url;
+    urlButton.addEventListener("click", () => {
+      const input = document.querySelector<HTMLInputElement>(historyKind === "batch" ? "#batch-url-input" : "#url-input")!;
+      input.value = entry.url;
+      closeHistory();
+    });
+    const meta = document.createElement("div");
+    meta.className = "history-meta";
+    const time = document.createElement("time");
+    time.textContent = formatHistoryTime(entry.createdAt);
+    const copy = document.createElement("button");
+    copy.type = "button";
+    copy.className = "task-btn";
+    copy.textContent = "复制";
+    copy.addEventListener("click", () => {
+      navigator.clipboard.writeText(entry.url).catch(() => {});
+      copy.textContent = "已复制";
+      setTimeout(() => { copy.textContent = "复制"; }, 1500);
+    });
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "task-btn delete-btn";
+    remove.textContent = "删除";
+    remove.addEventListener("click", async () => {
+      await invoke("delete_history", { id: entry.id });
+      item.remove();
+      const count = document.querySelector<HTMLSpanElement>("#history-count")!;
+      count.textContent = `${Math.max(0, (parseInt(count.textContent) || 1) - 1)} 条记录`;
+      if (!list.querySelector(".history-item")) renderHistory([]);
+    });
+    const actions = document.createElement("div");
+    actions.className = "history-actions";
+    actions.append(copy, remove);
+    meta.append(time, actions);
+    item.append(urlButton, meta);
+    list.append(item);
+  }
+}
+
+async function refreshHistory() {
+  try {
+    renderHistory(await invoke<HistoryEntry[]>("get_history", { kind: historyKind }));
+  } catch {
+    renderHistory([]);
+  }
+}
+
+function openHistory(kind: "detect" | "batch") {
+  historyKind = kind;
+  document.querySelector<HTMLHeadingElement>("#history-title")!.textContent = kind === "batch" ? "批量下载历史" : "视频探测历史";
+  document.querySelector<HTMLDivElement>("#history-overlay")!.classList.add("open");
+  const drawer = document.querySelector<HTMLElement>("#history-drawer")!;
+  drawer.classList.add("open");
+  drawer.setAttribute("aria-hidden", "false");
+  void refreshHistory();
+}
+
+function closeHistory() {
+  document.querySelector<HTMLDivElement>("#history-overlay")!.classList.remove("open");
+  const drawer = document.querySelector<HTMLElement>("#history-drawer")!;
+  drawer.classList.remove("open");
+  drawer.setAttribute("aria-hidden", "true");
+}
+
+document.querySelector<HTMLButtonElement>("#history-btn")!.addEventListener("click", () => {
+  openHistory(activeView === "批量下载" ? "batch" : "detect");
+});
+document.querySelector<HTMLButtonElement>("#history-close")!.addEventListener("click", closeHistory);
+document.querySelector<HTMLDivElement>("#history-overlay")!.addEventListener("click", closeHistory);
+document.addEventListener("keydown", (event) => { if (event.key === "Escape") closeHistory(); });
+document.querySelector<HTMLButtonElement>("#history-clear")!.addEventListener("click", async () => {
+  if (!window.confirm("确定清空当前类别的全部历史记录？")) return;
+  await invoke("clear_history", { kind: historyKind });
+  renderHistory([]);
+});
+
 document.querySelectorAll<HTMLButtonElement>(".nav-item").forEach((button) => button.addEventListener("click", () => {
   const view = button.dataset.view;
+  activeView = view ?? "探测器";
   document.querySelectorAll(".nav-item").forEach((item) => item.classList.toggle("active", item === button));
   document.querySelector<HTMLDivElement>("#detector-view")!.hidden = view !== "探测器";
   document.querySelector<HTMLDivElement>("#batch-view")!.hidden = view !== "批量下载";
@@ -652,6 +763,7 @@ document.querySelectorAll<HTMLButtonElement>(".nav-item").forEach((button) => bu
   document.querySelector<HTMLDivElement>("#lan-view")!.hidden = view !== "局域网";
   document.querySelector<HTMLDivElement>("#settings-view")!.hidden = view !== "设置";
   document.querySelector<HTMLSpanElement>("#page-title")!.textContent = view ?? "视频探测器";
+  document.querySelector<HTMLButtonElement>("#history-btn")!.hidden = view !== "探测器" && view !== "批量下载";
   if (view === "局域网") void refreshLanInfo();
 }));
 

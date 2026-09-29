@@ -148,6 +148,15 @@ impl Default for AppSettings {
     }
 }
 
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HistoryEntry {
+    id: String,
+    url: String,
+    kind: String,
+    created_at: String,
+}
+
 struct LanServer {
     port: u32,
     server: Arc<tiny_http::Server>,
@@ -165,6 +174,8 @@ struct AppState {
     download_queue: Mutex<VecDeque<QueuedDownload>>,
     tasks: Mutex<HashMap<String, TaskRecord>>,
     tasks_path: PathBuf,
+    history: Mutex<Vec<HistoryEntry>>,
+    history_path: PathBuf,
     settings: RwLock<AppSettings>,
   settings_path: PathBuf,
     lan_server: Mutex<Option<Arc<LanServer>>>,
@@ -173,13 +184,15 @@ struct AppState {
 }
 
 impl AppState {
-   fn new(settings: AppSettings, settings_path: PathBuf, tasks: HashMap<String, TaskRecord>, tasks_path: PathBuf) -> Self {
+   fn new(settings: AppSettings, settings_path: PathBuf, tasks: HashMap<String, TaskRecord>, tasks_path: PathBuf, history: Vec<HistoryEntry>, history_path: PathBuf) -> Self {
         Self {
             media: Mutex::default(),
             downloads: Mutex::default(),
             download_queue: Mutex::default(),
             tasks: Mutex::new(tasks),
             tasks_path,
+            history: Mutex::new(history),
+            history_path,
             settings: RwLock::new(settings),
             settings_path,
             lan_server: Mutex::default(),
@@ -212,6 +225,48 @@ fn save_tasks_locked(tasks: &HashMap<String, TaskRecord>, path: &PathBuf) {
         Ok(json) => { if let Err(error) = std::fs::write(path, json) { debug_log(&format!("[tasks] save failed: {error}")); } }
         Err(error) => debug_log(&format!("[tasks] serialize failed: {error}")),
     }
+}
+
+fn save_history_locked(history: &[HistoryEntry], path: &PathBuf) {
+    match serde_json::to_vec_pretty(history) {
+        Ok(json) => { if let Err(error) = std::fs::write(path, json) { debug_log(&format!("[history] save failed: {error}")); } }
+        Err(error) => debug_log(&format!("[history] serialize failed: {error}")),
+    }
+}
+
+/// 记录一条处理过的 URL：同 kind+url 去重置顶，每类最多保留 100 条
+fn record_history(state: &AppState, url: &str, kind: &str) {
+    let Ok(mut history) = state.history.lock() else { return; };
+    history.retain(|entry| !(entry.kind == kind && entry.url == url));
+    let millis = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
+    history.insert(0, HistoryEntry { id: format!("h{millis}"), url: url.to_string(), kind: kind.to_string(), created_at: chrono_time() });
+    let mut seen = 0usize;
+    history.retain(|entry| {
+        if entry.kind == kind { seen += 1; seen <= 100 } else { true }
+    });
+    save_history_locked(&history, &state.history_path);
+}
+
+#[tauri::command]
+fn get_history(state: tauri::State<'_, AppState>, kind: String) -> Result<Vec<HistoryEntry>, String> {
+    let history = state.history.lock().map_err(|_| "历史记录锁定失败".to_string())?;
+    Ok(history.iter().filter(|entry| entry.kind == kind).cloned().collect())
+}
+
+#[tauri::command]
+fn delete_history(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
+    let mut history = state.history.lock().map_err(|_| "历史记录锁定失败".to_string())?;
+    history.retain(|entry| entry.id != id);
+    save_history_locked(&history, &state.history_path);
+    Ok(())
+}
+
+#[tauri::command]
+fn clear_history(state: tauri::State<'_, AppState>, kind: String) -> Result<(), String> {
+    let mut history = state.history.lock().map_err(|_| "历史记录锁定失败".to_string())?;
+    history.retain(|entry| entry.kind != kind);
+    save_history_locked(&history, &state.history_path);
+    Ok(())
 }
 
 fn emit_download(app: &AppHandle, update: DownloadUpdate) {
@@ -847,6 +902,7 @@ async fn open_page(app: AppHandle, state: tauri::State<'_, AppState>, url: Strin
     if !is_allowed_url(&url) { return Err("请输入有效的 http 或 https 网页地址".to_string()); }
     let settings = state.settings.read().await.clone();
     debug_log(&format!("[open_page] url={url}"));
+    record_history(&state, &url, "detect");
     open_headless_page(app, &state, &url, &settings).await
 }
 
@@ -886,8 +942,10 @@ async fn save_settings(app: AppHandle, state: tauri::State<'_, AppState>, settin
 }
 
 #[tauri::command]
-async fn open_visible_page(app: AppHandle, state: tauri::State<'_, AppState>, url: String) -> Result<(), String> {
+async fn open_visible_page(app: AppHandle, state: tauri::State<'_, AppState>, url: String, kind: Option<String>) -> Result<(), String> {
     if !is_allowed_url(&url) { return Err("请输入有效的 http 或 https 网页地址".into()); }
+    let kind = if kind.as_deref() == Some("batch") { "batch" } else { "detect" };
+    record_history(&state, &url, kind);
     open_visible_page_inner(app, &state, url).await
 }
 
@@ -1502,6 +1560,7 @@ async fn fetch_page_context(browser: &Arc<Browser>, url: &str) -> Result<(String
 async fn analyze_episodes(app: AppHandle, state: tauri::State<'_, AppState>, url: String) -> Result<AnalyzeResult, String> {
     debug_log(&format!("[analyze_episodes] start url={url}"));
     if !is_allowed_url(&url) { debug_log(&format!("[analyze_episodes] rejected invalid url: {url}")); return Err("请输入有效的 http 或 https 网页地址".to_string()); }
+    record_history(&state, &url, "batch");
     let settings = state.settings.read().await.clone();
     ensure_headless_browser(&app, &state, &settings).await?;
     let browser = state.headless_browser.lock().await.clone().ok_or("Chromium 初始化失败")?;
@@ -2266,9 +2325,13 @@ pub fn run() {
             }
             if dirty { save_tasks_locked(&tasks, &tasks_path); }
             debug_log(&format!("[setup] loaded {} persisted tasks", tasks.len()));
+            let history_path = app.path().app_config_dir()?.join("history.json");
+            let history: Vec<HistoryEntry> = std::fs::read(&history_path).ok()
+                .and_then(|contents| serde_json::from_slice::<Vec<HistoryEntry>>(&contents).ok())
+                .unwrap_or_default();
             let lan_enabled = settings.lan_enabled;
             let lan_port = settings.lan_port;
-            app.manage(AppState::new(settings, settings_path, tasks, tasks_path));
+            app.manage(AppState::new(settings, settings_path, tasks, tasks_path, history, history_path));
             if lan_enabled {
                 if let Err(error) = start_lan_server(&app.handle(), lan_port) {
                     debug_log(&format!("[setup] lan server autostart failed: {error}"));
@@ -2276,7 +2339,7 @@ pub fn run() {
             }
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![open_page, open_visible_page, capture_media, visible_log, report_page_links, get_media, get_settings, save_settings, start_download, cancel_download, retry_download, delete_task, get_tasks, clear_completed_tasks, show_in_folder, clear_media, analyze_episodes, analyze_page_links, batch_download, get_lan_info])
+        .invoke_handler(tauri::generate_handler![open_page, open_visible_page, capture_media, visible_log, report_page_links, get_media, get_settings, save_settings, start_download, cancel_download, retry_download, delete_task, get_tasks, clear_completed_tasks, show_in_folder, clear_media, analyze_episodes, analyze_page_links, batch_download, get_lan_info, get_history, delete_history, clear_history])
         .run(tauri::generate_context!("Tauri.toml"))
         .expect("Video Scout failed to start");
 }
